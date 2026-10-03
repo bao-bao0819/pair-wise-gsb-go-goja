@@ -2,6 +2,7 @@ package goja
 
 import (
 	"bytes"
+	stdctx "context"
 	"errors"
 	"fmt"
 	"go/ast"
@@ -1494,6 +1495,57 @@ func (r *Runtime) RunProgram(p *Program) (result Value, err error) {
 		r.leave()
 	}
 	return
+}
+
+// RunProgramContext is like RunProgram, but binds the given context to this
+// execution: if ctx is cancelled while the program is running, the interpreter
+// is interrupted and ctx.Err() is returned.
+//
+// The cancellation is scoped to this execution only. Once RunProgramContext
+// returns, the context's cancellation callback can no longer affect subsequent
+// executions on this Runtime, and cleaning up the callback never clears an
+// interrupt raised via Interrupt(). If the program completes before the
+// cancellation is observed by the interpreter, the program's result is
+// returned; otherwise ctx.Err() is returned.
+//
+// If ctx is already cancelled, the program is not executed at all and
+// ctx.Err() is returned immediately.
+//
+// When called from a Go (host) function that is itself called from a running
+// script, the nested execution inherits the enclosing execution's generation:
+// it is governed by the context of the outermost RunProgramContext (if any)
+// and ctx is ignored.
+//
+// Note, the cancellation only interrupts the JavaScript interpreter; it does
+// not terminate a blocking Go function called from the script.
+func (r *Runtime) RunProgramContext(ctx stdctx.Context, p *Program) (Value, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	vm := r.vm
+	if len(vm.callStack) > 0 {
+		// Nested execution from a host callback: inherits the enclosing
+		// execution's generation.
+		return r.RunProgram(p)
+	}
+	gen := vm.beginCtxExecution()
+	stop := stdctx.AfterFunc(ctx, func() {
+		vm.interruptIfGen(gen, ctxInterruptTag{gen: gen})
+	})
+	defer func() {
+		stop()
+		vm.endCtxExecution(gen)
+	}()
+	result, err := r.RunProgram(p)
+	if err != nil {
+		var intErr *InterruptedError
+		if errors.As(err, &intErr) {
+			if tag, ok := intErr.iface.(ctxInterruptTag); ok && tag.gen == gen {
+				return nil, ctx.Err()
+			}
+		}
+	}
+	return result, err
 }
 
 // CaptureCallStack appends the current call stack frames to the stack slice (which may be nil) up to the specified depth.

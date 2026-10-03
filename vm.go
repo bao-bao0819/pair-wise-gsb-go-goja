@@ -381,6 +381,9 @@ type vm struct {
 	interrupted   uint32
 	interruptVal  interface{}
 	interruptLock sync.Mutex
+	// interruptGen is the generation of the current RunProgramContext execution.
+	// It is guarded by interruptLock.
+	interruptGen uint64
 
 	curAsyncRunner *asyncRunner
 
@@ -693,6 +696,46 @@ func (vm *vm) Interrupt(v interface{}) {
 
 func (vm *vm) ClearInterrupt() {
 	atomic.StoreUint32(&vm.interrupted, 0)
+}
+
+// ctxInterruptTag is the interrupt value used by RunProgramContext to mark a
+// cancellation as belonging to a particular execution generation, so that it
+// can be told apart from interrupts triggered by Interrupt().
+type ctxInterruptTag struct {
+	gen uint64
+}
+
+// beginCtxExecution starts a new interrupt generation and returns it.
+func (vm *vm) beginCtxExecution() uint64 {
+	vm.interruptLock.Lock()
+	defer vm.interruptLock.Unlock()
+	vm.interruptGen++
+	return vm.interruptGen
+}
+
+// interruptIfGen raises an interrupt carrying v, but only if gen is still the
+// current generation. This guarantees that a cancellation callback cannot
+// affect executions that start after its own generation has ended.
+func (vm *vm) interruptIfGen(gen uint64, v interface{}) {
+	vm.interruptLock.Lock()
+	defer vm.interruptLock.Unlock()
+	if vm.interruptGen == gen {
+		vm.interruptVal = v
+		atomic.StoreUint32(&vm.interrupted, 1)
+	}
+}
+
+// endCtxExecution invalidates gen so that its cancellation callback can no
+// longer raise interrupts, and clears the interrupt flag only if it was raised
+// by this generation. Interrupts triggered via Interrupt() are left untouched.
+func (vm *vm) endCtxExecution(gen uint64) {
+	vm.interruptLock.Lock()
+	defer vm.interruptLock.Unlock()
+	vm.interruptGen++
+	if tag, ok := vm.interruptVal.(ctxInterruptTag); ok && tag.gen == gen {
+		vm.interruptVal = nil
+		atomic.StoreUint32(&vm.interrupted, 0)
+	}
 }
 
 func getFuncName(stack []Value, sb int) unistring.String {

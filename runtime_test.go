@@ -1,6 +1,7 @@
 package goja
 
 import (
+	stdctx "context"
 	"errors"
 	"fmt"
 	"math"
@@ -455,6 +456,239 @@ func TestInterrupt(t *testing.T) {
 	_, err := vm.RunString(SCRIPT)
 	if err == nil {
 		t.Fatal("Err is nil")
+	}
+}
+
+func TestRunProgramContextPreCancelled(t *testing.T) {
+	rt := New()
+	entered := false
+	err := rt.Set("mark", func() { entered = true })
+	if err != nil {
+		t.Fatal(err)
+	}
+	p := MustCompile("test.js", "mark(); 1", false)
+
+	ctx, cancel := stdctx.WithCancel(stdctx.Background())
+	cancel()
+	_, err = rt.RunProgramContext(ctx, p)
+	if !errors.Is(err, stdctx.Canceled) {
+		t.Fatalf("expected stdctx.Canceled, got %v", err)
+	}
+	if entered {
+		t.Fatal("script was entered with a pre-cancelled context")
+	}
+	// The pre-cancelled context must not leave an interrupt behind.
+	v, err := rt.RunString("42")
+	if err != nil {
+		t.Fatalf("unexpected error after pre-cancelled run: %v", err)
+	}
+	if v.ToInteger() != 42 {
+		t.Fatalf("unexpected result: %v", v)
+	}
+}
+
+func TestRunProgramContextCancelDuringExecution(t *testing.T) {
+	for i := 0; i < 50; i++ {
+		rt := New()
+		started := make(chan struct{})
+		err := rt.Set("started", func() { close(started) })
+		if err != nil {
+			t.Fatal(err)
+		}
+		p := MustCompile("loop.js", "started(); for (;;) {}", false)
+
+		ctx, cancel := stdctx.WithCancel(stdctx.Background())
+		errCh := make(chan error, 1)
+		go func() {
+			_, err := rt.RunProgramContext(ctx, p)
+			errCh <- err
+		}()
+		<-started
+		cancel()
+		if err := <-errCh; !errors.Is(err, stdctx.Canceled) {
+			t.Fatalf("iteration %d: expected stdctx.Canceled, got %v", i, err)
+		}
+		// No late cancellation may leak into the next execution.
+		v, err := rt.RunString("42")
+		if err != nil {
+			t.Fatalf("iteration %d: unexpected error after cancellation: %v", i, err)
+		}
+		if v.ToInteger() != 42 {
+			t.Fatalf("iteration %d: unexpected result: %v", i, v)
+		}
+	}
+}
+
+func TestRunProgramContextCancelAtReturnBoundary(t *testing.T) {
+	for i := 0; i < 50; i++ {
+		rt := New()
+		inHost := make(chan struct{})
+		release := make(chan struct{})
+		err := rt.Set("fence", func() int {
+			close(inHost)
+			<-release
+			return 7
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		p := MustCompile("ret.js", "fence()", false)
+
+		ctx, cancel := stdctx.WithCancel(stdctx.Background())
+		type result struct {
+			v   Value
+			err error
+		}
+		resCh := make(chan result, 1)
+		go func() {
+			v, err := rt.RunProgramContext(ctx, p)
+			resCh <- result{v, err}
+		}()
+		<-inHost
+		// Cancel while the interpreter is blocked in the last host call of the
+		// script, i.e. right at the return boundary.
+		cancel()
+		close(release)
+		res := <-resCh
+		// The race between completion and cancellation is resolved either way:
+		// if the interpreter observed the cancellation, ctx.Err() is returned,
+		// otherwise the program's own result wins. Exactly one of the two.
+		if res.err != nil {
+			if !errors.Is(res.err, stdctx.Canceled) {
+				t.Fatalf("iteration %d: expected stdctx.Canceled, got %v", i, res.err)
+			}
+		} else if res.v.ToInteger() != 7 {
+			t.Fatalf("iteration %d: unexpected result: %v", i, res.v)
+		}
+		// No late cancellation may leak into the next execution.
+		v, err := rt.RunString("42")
+		if err != nil {
+			t.Fatalf("iteration %d: unexpected error after cancellation: %v", i, err)
+		}
+		if v.ToInteger() != 42 {
+			t.Fatalf("iteration %d: unexpected result: %v", i, v)
+		}
+	}
+}
+
+func TestRunProgramContextCancelAfterReturn(t *testing.T) {
+	rt := New()
+	p := MustCompile("test.js", "1 + 2", false)
+	ctx, cancel := stdctx.WithCancel(stdctx.Background())
+	v, err := rt.RunProgramContext(ctx, p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if v.ToInteger() != 3 {
+		t.Fatalf("unexpected result: %v", v)
+	}
+	// Cancelling after the method returned must not affect subsequent executions.
+	cancel()
+	v, err = rt.RunString("42")
+	if err != nil {
+		t.Fatalf("unexpected error after late cancellation: %v", err)
+	}
+	if v.ToInteger() != 42 {
+		t.Fatalf("unexpected result: %v", v)
+	}
+}
+
+func TestRunProgramContextExternalInterruptPreserved(t *testing.T) {
+	rt := New()
+	started := make(chan struct{})
+	err := rt.Set("started", func() { close(started) })
+	if err != nil {
+		t.Fatal(err)
+	}
+	p := MustCompile("loop.js", "started(); for (;;) {}", false)
+
+	ctx, cancel := stdctx.WithCancel(stdctx.Background())
+	defer cancel()
+	errCh := make(chan error, 1)
+	go func() {
+		_, err := rt.RunProgramContext(ctx, p)
+		errCh <- err
+	}()
+	<-started
+	rt.Interrupt("external")
+	err = <-errCh
+	var intErr *InterruptedError
+	if !errors.As(err, &intErr) || intErr.Value() != "external" {
+		t.Fatalf("expected *InterruptedError(external), got %v", err)
+	}
+	// The context cleanup must not leave anything behind either.
+	v, err := rt.RunString("42")
+	if err != nil {
+		t.Fatalf("unexpected error after external interrupt: %v", err)
+	}
+	if v.ToInteger() != 42 {
+		t.Fatalf("unexpected result: %v", v)
+	}
+}
+
+func TestRunProgramContextCleanupPreservesExternalInterrupt(t *testing.T) {
+	rt := New()
+	vm := rt.vm
+	// Simulate the interleaving where the context cancellation fires, and an
+	// external Interrupt() arrives before the execution's cleanup runs.
+	gen := vm.beginCtxExecution()
+	vm.interruptIfGen(gen, ctxInterruptTag{gen: gen})
+	rt.Interrupt("external")
+	vm.endCtxExecution(gen)
+	// The external interrupt must not have been wiped by the cleanup: per
+	// Interrupt() semantics the next run is interrupted immediately.
+	_, err := rt.RunString("1")
+	var intErr *InterruptedError
+	if !errors.As(err, &intErr) || intErr.Value() != "external" {
+		t.Fatalf("expected the external interrupt to survive, got %v", err)
+	}
+	rt.ClearInterrupt()
+	v, err := rt.RunString("42")
+	if err != nil {
+		t.Fatalf("unexpected error after ClearInterrupt: %v", err)
+	}
+	if v.ToInteger() != 42 {
+		t.Fatalf("unexpected result: %v", v)
+	}
+}
+
+func TestRunProgramContextNested(t *testing.T) {
+	rt := New()
+	innerStarted := make(chan struct{})
+	err := rt.Set("innerStarted", func() { close(innerStarted) })
+	if err != nil {
+		t.Fatal(err)
+	}
+	inner := MustCompile("inner.js", "innerStarted(); for (;;) {}", false)
+	// The nested execution uses its own, never-cancelled context; it must
+	// inherit the generation of the enclosing execution instead.
+	innerCtx := stdctx.Background()
+	err = rt.Set("nested", func() {
+		_, _ = rt.RunProgramContext(innerCtx, inner)
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	outer := MustCompile("outer.js", "nested()", false)
+
+	ctx, cancel := stdctx.WithCancel(stdctx.Background())
+	errCh := make(chan error, 1)
+	go func() {
+		_, err := rt.RunProgramContext(ctx, outer)
+		errCh <- err
+	}()
+	<-innerStarted
+	cancel()
+	if err := <-errCh; !errors.Is(err, stdctx.Canceled) {
+		t.Fatalf("expected stdctx.Canceled, got %v", err)
+	}
+	// No late cancellation may leak into the next execution.
+	v, err := rt.RunString("42")
+	if err != nil {
+		t.Fatalf("unexpected error after cancellation: %v", err)
+	}
+	if v.ToInteger() != 42 {
+		t.Fatalf("unexpected result: %v", v)
 	}
 }
 
