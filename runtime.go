@@ -204,6 +204,13 @@ type Runtime struct {
 
 	jobQueue []func()
 
+	// manualJobPump, when enabled, prevents leave() from automatically draining
+	// the promise job queue when the top level script returns. The queue is then
+	// advanced by the caller via RunJobs().
+	manualJobPump bool
+	// jobPumpRunning marks an active RunJobs() call and makes the pump non-reentrant.
+	jobPumpRunning bool
+
 	promiseRejectionTracker PromiseRejectionTracker
 	asyncContextTracker     AsyncContextTracker
 
@@ -1444,6 +1451,10 @@ func asUncatchableException(v interface{}) error {
 func (r *Runtime) RunProgram(p *Program) (result Value, err error) {
 	vm := r.vm
 	recursive := len(vm.callStack) > 0
+	if r.jobPumpRunning && !recursive {
+		err = errors.New("cannot run a top level script while a job pump is running")
+		return
+	}
 	defer func() {
 		if recursive {
 			vm.sp -= 2
@@ -1519,6 +1530,9 @@ func (r *Runtime) CaptureCallStack(depth int, stack []StackFrame) []StackFrame {
 // Interrupt a running JavaScript. The corresponding Go call will return an *InterruptedError containing v.
 // If the interrupt propagates until the stack is empty the currently queued promise resolve/reject jobs will be cleared
 // without being executed. This is the same time they would be executed otherwise.
+// This clearing only applies to the default automatic mode: when the manual job
+// pump is enabled (see Runtime.SetManualJobPump) the queued jobs, including the
+// interrupted one, are retained for the next Runtime.RunJobs() call.
 // Note, it only works while in JavaScript code, it does not interrupt native Go functions (which includes all built-ins).
 // If the runtime is currently not running, it will be immediately interrupted on the next Run*() call.
 // To avoid that use ClearInterrupt()
@@ -2983,21 +2997,167 @@ func (r *Runtime) getHash() *maphash.Hash {
 
 // called when the top level function returns normally (i.e. control is passed outside the Runtime).
 func (r *Runtime) leave() {
-	var jobs []func()
-	for len(r.jobQueue) > 0 {
-		jobs, r.jobQueue = r.jobQueue, jobs[:0]
-		for _, job := range jobs {
-			job()
+	if !r.manualJobPump {
+		var jobs []func()
+		for len(r.jobQueue) > 0 {
+			jobs, r.jobQueue = r.jobQueue, jobs[:0]
+			for _, job := range jobs {
+				job()
+			}
 		}
+		r.jobQueue = nil
 	}
-	r.jobQueue = nil
 	r.vm.stack = nil
 }
 
 // called when the top level function returns (i.e. control is passed outside the Runtime) but it was due to an interrupt
 func (r *Runtime) leaveAbrupt() {
-	r.jobQueue = nil
+	if !r.manualJobPump {
+		r.jobQueue = nil
+	}
 	r.ClearInterrupt()
+}
+
+// JobPumpResult is the result of a single manual job pump run (see RunJobs).
+type JobPumpResult struct {
+	// Ran is the number of jobs executed during this run.
+	Ran int
+	// HasPending is true if the job queue was not fully consumed (either because
+	// the budget was exhausted or because the run was stopped by an error).
+	HasPending bool
+	// Err holds the first uncatchable error that stopped the run (e.g. an
+	// *InterruptedError or a *StackOverflowError), or the first unhandled error
+	// that escaped a job. Ordinary rejected promises are reported through the
+	// PromiseRejectionTracker and never appear here. The job that failed and all
+	// jobs queued behind it are kept intact (the failed job stays at the head and
+	// is retried first), so the run can be continued with another RunJobs() call
+	// after the error has been dealt with (e.g. after
+	// Runtime.ClearInterrupt()).
+	Err error
+}
+
+// SetManualJobPump enables or disables the manual promise job pump mode.
+//
+// By default (disabled) the runtime automatically drains the promise job queue
+// every time the top level script or function call returns. When enabled the
+// queue is left intact on return and must be advanced manually using RunJobs().
+// This allows an embedded caller to regain control in the middle of a long
+// promise chain and process reactions in bounded batches.
+//
+// It must be called while the runtime is idle (i.e. not from inside a running
+// script or an active RunJobs() call). Jobs already queued at the moment of
+// switching are not lost: if the mode is enabled they become pending for the
+// next RunJobs() call, if it is disabled they will be drained on the next
+// return as usual.
+//
+// As with all other Runtime methods this must not be called concurrently with
+// any other operation on the same Runtime, a Runtime is not safe for use by
+// multiple goroutines simultaneously.
+func (r *Runtime) SetManualJobPump(enabled bool) {
+	if r.jobPumpRunning {
+		panic(r.NewTypeError("cannot change the job pump mode while a job pump is running"))
+	}
+	r.manualJobPump = enabled
+}
+
+// RunJobs executes at most maxJobs queued promise jobs (microtasks) in FIFO
+// order. Jobs enqueued by an executing job are appended to the tail of the
+// queue and may run within the same call if the budget allows.
+//
+// If maxJobs is zero or negative the queue is drained completely. Exhausting a
+// positive budget is a normal pause: promise states, async execution contexts
+// and rejection tracking remain consistent and a subsequent call continues
+// exactly where this one stopped.
+//
+// RunJobs is only available in the manual job pump mode (see SetManualJobPump).
+// It must not be called reentrantly, including from a Go or JavaScript function
+// invoked while a pump run is in progress.
+//
+// A normal promise rejection is not an error here: jobs route handler throws
+// into promise rejections (and the PromiseRejectionTracker), the run keeps
+// going and JobPumpResult.Err stays nil. Err is set only when a job cannot
+// complete: an uncatchable error such as *InterruptedError or
+// *StackOverflowError, or a panic that escapes a native Go function. In that
+// case the run stops, Ran counts only the jobs that completed, and the job that
+// failed remains at the head of the queue together with every job queued behind
+// it. The pending queue is never silently discarded.
+//
+// On Runtime.Interrupt the current job is stopped, Err is the
+// *InterruptedError and that job is retried first on the next call after
+// Runtime.ClearInterrupt(); any state it wrote before being interrupted is
+// retained, exactly like re-running the same script after an interrupt.
+//
+// A Runtime remains not safe for concurrent use by multiple goroutines.
+func (r *Runtime) RunJobs(maxJobs int) (result JobPumpResult) {
+	if !r.manualJobPump {
+		result.Err = errors.New("manual job pump is not enabled, use SetManualJobPump")
+		result.HasPending = len(r.jobQueue) > 0
+		return
+	}
+	if r.jobPumpRunning {
+		result.Err = errors.New("job pump reentrancy is not allowed")
+		result.HasPending = len(r.jobQueue) > 0
+		return
+	}
+	if len(r.vm.callStack) != 0 {
+		result.Err = errors.New("RunJobs cannot be called while JavaScript is running")
+		result.HasPending = len(r.jobQueue) > 0
+		return
+	}
+
+	r.jobPumpRunning = true
+	defer func() {
+		r.jobPumpRunning = false
+		if x := recover(); x != nil {
+			if ex := asUncatchableException(x); ex != nil {
+				result.Err = ex
+			} else if ex, ok := x.(*Exception); ok {
+				result.Err = ex
+			} else {
+				panic(x)
+			}
+		}
+		// Compact the slice exactly once. result.Ran jobs were consumed from
+		// the front; a job stopped by an uncatchable error (notably an
+		// interrupt) was not consumed and stays at the new head, so it is
+		// retried on the next call rather than silently lost.
+		consumed := result.Ran
+		if consumed > 0 {
+			remaining := len(r.jobQueue) - consumed
+			copy(r.jobQueue, r.jobQueue[consumed:])
+			for i := remaining; i < len(r.jobQueue); i++ {
+				r.jobQueue[i] = nil
+			}
+			r.jobQueue = r.jobQueue[:remaining]
+		}
+		result.HasPending = len(r.jobQueue) > 0
+		r.vm.stack = nil
+	}()
+
+	head := 0
+	for head < len(r.jobQueue) && (maxJobs <= 0 || result.Ran < maxJobs) {
+		job := r.jobQueue[head]
+		head++
+
+		// vm.try returns a caught *Exception for normal throws (the promise
+		// machinery turns them into rejections); uncatchable errors such as
+		// *InterruptedError are re-panicked and reach the deferred cleanup with
+		// the current job still unconsumed.
+		ex := r.vm.try(job)
+		result.Ran++
+		if ex != nil {
+			result.Err = ex
+			break
+		}
+	}
+	return
+}
+
+// HasPendingJobs reports whether the promise job queue currently holds jobs
+// waiting to be executed. In the default automatic mode the queue is drained on
+// every return, so this is mainly useful in the manual job pump mode.
+func (r *Runtime) HasPendingJobs() bool {
+	return len(r.jobQueue) > 0
 }
 
 func nilSafe(v Value) Value {
