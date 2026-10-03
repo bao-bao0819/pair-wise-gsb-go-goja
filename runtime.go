@@ -207,6 +207,9 @@ type Runtime struct {
 	promiseRejectionTracker PromiseRejectionTracker
 	asyncContextTracker     AsyncContextTracker
 
+	manualJobPump bool
+	jobPumpActive bool
+
 	// Stack for tracking objects currently being converted to string
 	// to detect and handle circular references
 	toStringStack []*Object
@@ -1517,8 +1520,11 @@ func (r *Runtime) CaptureCallStack(depth int, stack []StackFrame) []StackFrame {
 }
 
 // Interrupt a running JavaScript. The corresponding Go call will return an *InterruptedError containing v.
-// If the interrupt propagates until the stack is empty the currently queued promise resolve/reject jobs will be cleared
-// without being executed. This is the same time they would be executed otherwise.
+// If the interrupt propagates until the stack is empty, then in the default (automatic draining) mode
+// the currently queued promise resolve/reject jobs are cleared without being executed. This is the same
+// time they would be executed otherwise, and they can be kept instead by enabling the manual job pump
+// mode (see Runtime.SetManualJobPump): in that mode an interruption inside PumpJobs is returned to the
+// caller while the remaining queue is retained, so the jobs are never silently lost.
 // Note, it only works while in JavaScript code, it does not interrupt native Go functions (which includes all built-ins).
 // If the runtime is currently not running, it will be immediately interrupted on the next Run*() call.
 // To avoid that use ClearInterrupt()
@@ -2983,6 +2989,29 @@ func (r *Runtime) getHash() *maphash.Hash {
 
 // called when the top level function returns normally (i.e. control is passed outside the Runtime).
 func (r *Runtime) leave() {
+	if !r.manualJobPump {
+		r.drainJobQueue()
+	}
+	r.vm.stack = nil
+}
+
+// called when the top level function returns (i.e. control is passed outside the Runtime) but it was due to an interrupt
+func (r *Runtime) leaveAbrupt() {
+	if !r.manualJobPump {
+		// Default automatic draining mode: queued jobs are dropped so that the
+		// runtime returns to a clean state after an interruption. This is a
+		// deliberate, documented policy (see Interrupt), the jobs do not silently
+		// disappear by accident. In manual pump mode the queue is retained so
+		// that the caller can resume it after ClearInterrupt().
+		r.jobQueue = nil
+	}
+	r.ClearInterrupt()
+}
+
+// drainJobQueue runs all currently queued (and transitively queued) promise
+// jobs in FIFO order. It is only used at the top level boundary in the
+// automatic (default) draining mode.
+func (r *Runtime) drainJobQueue() {
 	var jobs []func()
 	for len(r.jobQueue) > 0 {
 		jobs, r.jobQueue = r.jobQueue, jobs[:0]
@@ -2991,13 +3020,6 @@ func (r *Runtime) leave() {
 		}
 	}
 	r.jobQueue = nil
-	r.vm.stack = nil
-}
-
-// called when the top level function returns (i.e. control is passed outside the Runtime) but it was due to an interrupt
-func (r *Runtime) leaveAbrupt() {
-	r.jobQueue = nil
-	r.ClearInterrupt()
 }
 
 func nilSafe(v Value) Value {

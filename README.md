@@ -299,6 +299,43 @@ func TestInterrupt(t *testing.T) {
 }
 ```
 
+Manual Promise Job Pump
+-----------------------
+
+By default the promise reaction (microtask) queue is drained completely every time a top level script
+or callable returns to Go. An embedded host that wants to regain control in the middle of a long promise
+chain can instead enable a manual pump mode and advance the queue a bounded number of jobs per call:
+
+```go
+vm := goja.New()
+vm.SetManualJobPump(true)
+
+_, err := vm.RunString(`
+    Promise.resolve(0).then(function step(v) {
+        if (v < 1000) return step(v + 1);
+        globalThis.done = v;
+    });
+`)
+// err == nil, the promise chain is not run yet
+
+for {
+    executed, remaining, err := vm.PumpJobs(10)
+    if err != nil {
+        // An uncatchable error (e.g. *InterruptedError). The remaining queue is
+        // retained: resume with PumpJobs or drop it with DiscardPendingJobs().
+        break
+    }
+    // executed is the number of jobs run in this round, remaining is true if the
+    // budget was exhausted. Promise state and rejection tracking carry over.
+    if !remaining {
+        break
+    }
+}
+```
+
+The manual pump is still single-goroutine: a Runtime cannot be pumped re-entrantly or operated on from
+multiple goroutines.
+
 NodeJS Compatibility
 --------------------
 
