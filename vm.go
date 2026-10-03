@@ -382,6 +382,19 @@ type vm struct {
 	interruptVal  interface{}
 	interruptLock sync.Mutex
 
+	// genEpoch is the generation value a cancellation callback must match to be
+	// allowed to arm an interrupt. It names the generation whose interpreter
+	// body is currently running and is advanced (never reused) the moment the
+	// body finishes or a new run begins. Gen 0 is reserved for interrupts
+	// requested via Interrupt().
+	genEpoch uint32
+	// interruptGen is the generation an active interrupt belongs to. It is 0 for
+	// interrupts requested via Interrupt().
+	interruptGen uint32
+	// interruptForGenHook, if set, is invoked (under interruptLock) after a
+	// generation-scoped interrupt is armed or rejected. Intended for tests.
+	interruptForGenHook func(gen uint32, armed bool)
+
 	curAsyncRunner *asyncRunner
 
 	profTracker *profTracker
@@ -643,6 +656,7 @@ func (vm *vm) run() {
 			iface: vm.interruptVal,
 		}
 		v.stack = vm.captureStack(nil, 0)
+		v.interruptGen = vm.interruptGen
 		vm.interruptLock.Unlock()
 		panic(v)
 	}
@@ -687,12 +701,86 @@ func (vm *vm) runWithProfiler() bool {
 func (vm *vm) Interrupt(v interface{}) {
 	vm.interruptLock.Lock()
 	vm.interruptVal = v
+	vm.interruptGen = 0
 	atomic.StoreUint32(&vm.interrupted, 1)
 	vm.interruptLock.Unlock()
 }
 
+// interruptForGen arms the interrupt flag if the vm is still running the given
+// execution generation. gen 0 is reserved for Interrupt(), callers must pass a
+// non-zero generation. The check and the arming happen under the same lock so
+// that a late callback cannot win the race against the execution teardown.
+func (vm *vm) interruptForGen(gen uint32, v interface{}) {
+	vm.interruptLock.Lock()
+	armed := vm.armInterruptForGenLocked(gen, v)
+	if vm.interruptForGenHook != nil {
+		vm.interruptForGenHook(gen, armed)
+	}
+	vm.interruptLock.Unlock()
+}
+
+func (vm *vm) armInterruptForGenLocked(gen uint32, v interface{}) bool {
+	if vm.genEpoch != gen || gen == 0 {
+		return false
+	}
+	vm.interruptVal = v
+	vm.interruptGen = gen
+	atomic.StoreUint32(&vm.interrupted, 1)
+	return true
+}
+
 func (vm *vm) ClearInterrupt() {
+	vm.interruptLock.Lock()
 	atomic.StoreUint32(&vm.interrupted, 0)
+	vm.interruptGen = 0
+	vm.interruptLock.Unlock()
+}
+
+// clearInterruptForGen disarms the interrupt flag only if it belongs to the
+// given execution generation (i.e. it was installed by that generation's
+// context cancellation). An externally requested interrupt (gen 0) and
+// interrupts belonging to other generations are left intact.
+func (vm *vm) clearInterruptForGen(gen uint32) {
+	vm.interruptLock.Lock()
+	if vm.interruptGen == gen && gen != 0 {
+		atomic.StoreUint32(&vm.interrupted, 0)
+		vm.interruptGen = 0
+	}
+	vm.interruptLock.Unlock()
+}
+
+// beginExecution starts a new top-level execution generation. Any interrupt
+// left armed from a previous generation (for example a context cancellation
+// callback that fired after the previous run already returned) is disarmed;
+// externally requested interrupts are kept.
+func (vm *vm) beginExecution() uint32 {
+	vm.interruptLock.Lock()
+	vm.genEpoch++
+	gen := vm.genEpoch
+	if vm.interruptGen != 0 {
+		atomic.StoreUint32(&vm.interrupted, 0)
+		vm.interruptGen = 0
+	}
+	vm.interruptLock.Unlock()
+	return gen
+}
+
+// retireExecution closes the interrupt epoch of the current generation the
+// moment its interpreter body finishes, and disarms its interrupt, all
+// atomically. It runs synchronously before the rest of the run teardown (job
+// queue draining etc.), so a cancellation callback delivered at the return
+// boundary holds a stale epoch and can no longer affect this execution or the
+// next one.
+func (vm *vm) retireExecution(gen uint32) {
+	vm.interruptLock.Lock()
+	if vm.genEpoch == gen && gen != 0 {
+		vm.genEpoch++
+		if vm.interruptGen == gen {
+			atomic.StoreUint32(&vm.interrupted, 0)
+			vm.interruptGen = 0
+		}
+	}
+	vm.interruptLock.Unlock()
 }
 
 func getFuncName(stack []Value, sb int) unistring.String {

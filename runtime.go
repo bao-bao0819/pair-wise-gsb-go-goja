@@ -2,6 +2,7 @@ package goja
 
 import (
 	"bytes"
+	stdcontext "context"
 	"errors"
 	"fmt"
 	"go/ast"
@@ -331,6 +332,9 @@ func (e *baseUncatchableException) _uncatchableException() {}
 type InterruptedError struct {
 	baseUncatchableException
 	iface interface{}
+	// interruptGen records which execution generation the interrupt belonged
+	// to. 0 for interrupts requested via Interrupt().
+	interruptGen uint32
 }
 
 func (e *InterruptedError) Unwrap() error {
@@ -1442,8 +1446,61 @@ func asUncatchableException(v interface{}) error {
 
 // RunProgram executes a pre-compiled (see Compile()) code in the global context.
 func (r *Runtime) RunProgram(p *Program) (result Value, err error) {
+	return r.runProgram(nil, p)
+}
+
+// RunProgramContext is like RunProgram but binds the execution to ctx.
+//
+// If ctx is already cancelled the call returns immediately with an
+// *InterruptedError wrapping ctx.Err() without executing any of the script.
+// Otherwise cancelling ctx while the script is running interrupts the current
+// execution only: the returned error is an *InterruptedError and errors.Is(err,
+// ctx.Err()) succeeds.
+//
+// Cancellation only interrupts the interpreter loop, it does not forcefully
+// terminate a native Go function called from the script. If the script is
+// blocked inside such a function the cancellation takes effect as soon as
+// control returns to the interpreter (or not at all within this execution if
+// the function never returns).
+//
+// Interrupts requested via Interrupt() are independent of ctx and continue to
+// work; they take precedence over a concurrently arriving context cancellation.
+// Once this method returns, a late cancellation callback cannot affect any
+// subsequent Run*() call, nor does it clear interrupts requested via
+// Interrupt(). JS code invoked from a Go function called by the script is part
+// of the same execution and is covered by the same ctx.
+//
+// A nil ctx behaves exactly like RunProgram.
+func (r *Runtime) RunProgramContext(ctx stdcontext.Context, p *Program) (Value, error) {
+	return r.runProgram(ctx, p)
+}
+
+func (r *Runtime) runProgram(ctx stdcontext.Context, p *Program) (result Value, err error) {
 	vm := r.vm
 	recursive := len(vm.callStack) > 0
+
+	var gen uint32
+	if !recursive {
+		gen = vm.beginExecution()
+		if ctx != nil && ctx.Err() != nil {
+			return nil, &InterruptedError{
+				iface: ctx.Err(),
+			}
+		}
+	}
+
+	var stop chan struct{}
+	if ctx != nil && !recursive {
+		stop = make(chan struct{})
+		go func() {
+			select {
+			case <-ctx.Done():
+				vm.interruptForGen(gen, ctx.Err())
+			case <-stop:
+			}
+		}()
+	}
+
 	defer func() {
 		if recursive {
 			vm.sp -= 2
@@ -1455,13 +1512,26 @@ func (r *Runtime) RunProgram(p *Program) (result Value, err error) {
 			if ex := asUncatchableException(x); ex != nil {
 				err = ex
 				if len(vm.callStack) == 0 {
-					r.leaveAbrupt()
+					r.leaveAbrupt(interruptErrorGen(ex))
 				}
 			} else {
 				panic(x)
 			}
 		}
 	}()
+	defer func() {
+		if !recursive && stop != nil {
+			close(stop)
+		}
+	}()
+	// The interpreter body's generation is retired atomically as soon as
+	// control leaves it (on both normal and panicking paths): a cancellation
+	// callback delivered at the return boundary is then rejected, and the
+	// pending job queue drained below can no longer be interrupted by this
+	// execution's context.
+	if !recursive {
+		defer vm.retireExecution(gen)
+	}
 	if recursive {
 		vm.pushCtx()
 		vm.stash = &r.global.stash
@@ -1491,9 +1561,19 @@ func (r *Runtime) RunProgram(p *Program) (result Value, err error) {
 	} else {
 		vm.prg = nil
 		vm.sb = -1
-		r.leave()
+		r.leaveAfterRun(gen)
 	}
 	return
+}
+
+// interruptErrorGen returns the execution generation recorded on an
+// *InterruptedError, or 0 for any other error.
+func interruptErrorGen(err error) uint32 {
+	var intErr *InterruptedError
+	if errors.As(err, &intErr) {
+		return intErr.interruptGen
+	}
+	return 0
 }
 
 // CaptureCallStack appends the current call stack frames to the stack slice (which may be nil) up to the specified depth.
@@ -2530,7 +2610,7 @@ func (r *Runtime) runWrapped(f func()) (err error) {
 			if ex := asUncatchableException(x); ex != nil {
 				err = ex
 				if len(r.vm.callStack) == 0 {
-					r.leaveAbrupt()
+					r.leaveAbrupt(interruptErrorGen(ex))
 				}
 			} else {
 				panic(x)
@@ -2994,10 +3074,29 @@ func (r *Runtime) leave() {
 	r.vm.stack = nil
 }
 
-// called when the top level function returns (i.e. control is passed outside the Runtime) but it was due to an interrupt
-func (r *Runtime) leaveAbrupt() {
+// leaveAfterRun drains the job queue after a top-level run. If a stale
+// interrupt belonging to this execution's context cancellation was armed
+// concurrently with a normal completion (i.e. after the interpreter had already
+// finished) it is removed so it cannot affect the next execution. An externally
+// requested interrupt is left intact.
+func (r *Runtime) leaveAfterRun(gen uint32) {
+	r.vm.clearInterruptForGen(gen)
+	r.leave()
+}
+
+// called when the top level function returns (i.e. control is passed outside the Runtime) but it was due to an interrupt.
+// interruptGen is the generation of the interrupt that actually terminated the
+// run; only that interrupt is cleared, so an external interrupt (gen 0) that was
+// not the one which terminated the run cannot be unconditionally wiped.
+func (r *Runtime) leaveAbrupt(interruptGen uint32) {
 	r.jobQueue = nil
-	r.ClearInterrupt()
+	if interruptGen == 0 {
+		// Preserve the historical behaviour for interrupts requested via
+		// Interrupt(): the consumed interrupt is not sticky.
+		r.ClearInterrupt()
+	} else {
+		r.vm.clearInterruptForGen(interruptGen)
+	}
 }
 
 func nilSafe(v Value) Value {
