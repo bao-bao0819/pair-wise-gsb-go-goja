@@ -14,6 +14,7 @@ import (
 	"reflect"
 	"runtime"
 	"strconv"
+	"sync"
 	"time"
 
 	"golang.org/x/text/collate"
@@ -191,6 +192,11 @@ type Runtime struct {
 	now             Now
 	_collator       *collate.Collator
 	parserOptions   []parser.Option
+
+	execMu      sync.Mutex
+	execRunning bool
+	execOwner   uint64
+	execDepth   int
 
 	symbolRegistry map[unistring.String]*Symbol
 
@@ -1443,7 +1449,16 @@ func asUncatchableException(v interface{}) error {
 // RunProgram executes a pre-compiled (see Compile()) code in the global context.
 func (r *Runtime) RunProgram(p *Program) (result Value, err error) {
 	vm := r.vm
-	recursive := len(vm.callStack) > 0
+	// Nested execution is only valid from the goroutine that already owns the Runtime.
+	// A non-empty call stack on another goroutine means someone else is running, which is
+	// precisely the unsupported concurrent case.
+	recursive := len(vm.callStack) > 0 && r.ownedByCurrentGoroutine()
+	if !recursive {
+		if !r.tryEnterExecution() {
+			return nil, ErrRuntimeBusy
+		}
+		defer r.leaveExecution()
+	}
 	defer func() {
 		if recursive {
 			vm.sp -= 2
