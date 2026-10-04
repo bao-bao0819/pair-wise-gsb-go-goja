@@ -67,6 +67,10 @@ func (so *setObject) exportToArrayOrSlice(dst reflect.Value, typ reflect.Type, c
 	l := so.m.size
 	if typ.Kind() == reflect.Array {
 		if dst.Len() != l {
+			if ctx.diag != nil {
+				return ctx.newExportError(ExportErrorKindUnspecified, typ, nil,
+					fmt.Sprintf("cannot convert a Set into an array, lengths mismatch: have %d, need %d", l, dst.Len()))
+			}
 			return fmt.Errorf("cannot convert a Set into an array, lengths mismatch: have %d, need %d)", l, dst.Len())
 		}
 	} else {
@@ -80,7 +84,9 @@ func (so *setObject) exportToArrayOrSlice(dst reflect.Value, typ reflect.Type, c
 		if entry == nil {
 			break
 		}
-		err := r.toReflectValue(entry.key, dst.Index(i), ctx)
+		err := ctx.at(ExportIndexPathSegment{Index: i}, func() error {
+			return r.toReflectValue(entry.key, dst.Index(i), ctx)
+		})
 		if err != nil {
 			return err
 		}
@@ -94,16 +100,20 @@ func (so *setObject) exportToMap(dst reflect.Value, typ reflect.Type, ctx *objec
 	elemTyp := typ.Elem()
 	iter := so.m.newIter()
 	r := so.val.runtime
+	i := 0
 	for {
 		entry := iter.next()
 		if entry == nil {
 			break
 		}
 		keyVal := reflect.New(keyTyp).Elem()
-		err := r.toReflectValue(entry.key, keyVal, ctx)
+		err := ctx.at(ExportIndexPathSegment{Index: i}, func() error {
+			return r.toReflectValue(entry.key, keyVal, ctx)
+		})
 		if err != nil {
 			return err
 		}
+		i++
 		dst.SetMapIndex(keyVal, reflect.Zero(elemTyp))
 	}
 	return nil

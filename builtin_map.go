@@ -80,12 +80,16 @@ func (mo *mapObject) exportToMap(dst reflect.Value, typ reflect.Type, ctx *objec
 			break
 		}
 		keyVal := reflect.New(keyTyp).Elem()
-		err := r.toReflectValue(entry.key, keyVal, ctx)
+		err := ctx.at(ExportKeyPathSegment{Key: entry.key}, func() error {
+			return r.toReflectValue(entry.key, keyVal, ctx)
+		})
 		if err != nil {
 			return err
 		}
 		elemVal := reflect.New(elemTyp).Elem()
-		err = r.toReflectValue(entry.value, elemVal, ctx)
+		err = ctx.at(ExportKeyPathSegment{Key: entry.key}, func() error {
+			return r.toReflectValue(entry.value, elemVal, ctx)
+		})
 		if err != nil {
 			return err
 		}

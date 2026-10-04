@@ -151,6 +151,7 @@ type objectExportCacheItem map[reflect.Type]interface{}
 
 type objectExportCtx struct {
 	cache map[*Object]interface{}
+	diag  *diagnosticExportCtx
 }
 
 type objectImpl interface {
@@ -1005,21 +1006,43 @@ func genericExportToMap(o *Object, dst reflect.Value, typ reflect.Type, ctx *obj
 	for item, next := iter.next(); next != nil; item, next = next() {
 		var kv reflect.Value
 		var err error
+		var keyName string
 		if needConvertKeys {
 			kv = reflect.New(keyTyp).Elem()
-			err = r.toReflectValue(item.name, kv, ctx)
+			keyName = item.name.String()
+			err = ctx.at(ExportKeyPathSegment{Key: item.name}, func() error {
+				return r.toReflectValue(item.name, kv, ctx)
+			})
 			if err != nil {
+				if ctx.diag != nil {
+					return err
+				}
 				return fmt.Errorf("could not convert map key %s to %v: %w", item.name.String(), typ, err)
 			}
 		} else {
-			kv = reflect.ValueOf(item.name.String())
+			keyName = item.name.String()
+			kv = reflect.ValueOf(keyName)
 		}
 
-		ival := o.self.getStr(item.name.string(), nil)
+		var ival Value
+		err = ctx.at(ExportPropertyPathSegment{Name: keyName}, func() error {
+			return ctx.trap(ExportErrorKindGetterThrow, elemTyp, func() error {
+				ival = o.self.getStr(item.name.string(), nil)
+				return nil
+			})
+		})
+		if err != nil {
+			return err
+		}
 		if ival != nil {
 			vv := reflect.New(elemTyp).Elem()
-			err = r.toReflectValue(ival, vv, ctx)
+			err = ctx.at(ExportPropertyPathSegment{Name: keyName}, func() error {
+				return r.toReflectValue(ival, vv, ctx)
+			})
 			if err != nil {
+				if ctx.diag != nil {
+					return err
+				}
 				return fmt.Errorf("could not convert map value %v to %v at key %s: %w", ival, typ, item.name.String(), err)
 			}
 			dst.SetMapIndex(kv, vv)
@@ -1047,10 +1070,17 @@ func genericExportToArrayOrSlice(o *Object, dst reflect.Value, typ reflect.Type,
 			values = r.iterableToList(o, method)
 		})
 		if ex != nil {
+			if ctx.diag != nil {
+				return ctx.wrapFailure(typ, ExportErrorKindGetterThrow, ex)
+			}
 			return ex
 		}
 		if typ.Kind() == reflect.Array {
 			if dst.Len() != len(values) {
+				if ctx.diag != nil {
+					return ctx.newExportError(ExportErrorKindUnspecified, typ, nil,
+						fmt.Sprintf("cannot convert an iterable into an array, lengths mismatch (have %d, need %d)", len(values), dst.Len()))
+				}
 				return fmt.Errorf("cannot convert an iterable into an array, lengths mismatch (have %d, need %d)", len(values), dst.Len())
 			}
 		} else {
@@ -1058,7 +1088,9 @@ func genericExportToArrayOrSlice(o *Object, dst reflect.Value, typ reflect.Type,
 		}
 		ctx.putTyped(o, typ, dst.Interface())
 		for i, val := range values {
-			err = r.toReflectValue(val, dst.Index(i), ctx)
+			err = ctx.at(ExportIndexPathSegment{Index: i}, func() error {
+				return r.toReflectValue(val, dst.Index(i), ctx)
+			})
 			if err != nil {
 				return
 			}
@@ -1067,14 +1099,31 @@ func genericExportToArrayOrSlice(o *Object, dst reflect.Value, typ reflect.Type,
 		// array-like
 		var lp Value
 		if _, ok := o.self.assertCallable(); !ok {
-			lp = o.self.getStr("length", nil)
+			if ex := r.try(func() {
+				lp = o.self.getStr("length", nil)
+			}); ex != nil {
+				if ctx.diag != nil {
+					return ctx.at(ExportPropertyPathSegment{Name: "length"}, func() error {
+						return ctx.wrapFailure(typ, ExportErrorKindGetterThrow, ex)
+					})
+				}
+				return ex
+			}
 		}
 		if lp == nil {
+			if ctx.diag != nil {
+				return ctx.newExportError(ExportErrorKindTypeMismatch, typ, nil,
+					fmt.Sprintf("cannot convert %v to %v: not an array or iterable", o, typ))
+			}
 			return fmt.Errorf("cannot convert %v to %v: not an array or iterable", o, typ)
 		}
 		l := toIntStrict(toLength(lp))
 		if dst.Len() != l {
 			if typ.Kind() == reflect.Array {
+				if ctx.diag != nil {
+					return ctx.newExportError(ExportErrorKindUnspecified, typ, nil,
+						fmt.Sprintf("cannot convert an array-like object into an array, lengths mismatch (have %d, need %d)", l, dst.Len()))
+				}
 				return fmt.Errorf("cannot convert an array-like object into an array, lengths mismatch (have %d, need %d)", l, dst.Len())
 			} else {
 				dst.Set(reflect.MakeSlice(typ, l, l))
@@ -1082,8 +1131,16 @@ func genericExportToArrayOrSlice(o *Object, dst reflect.Value, typ reflect.Type,
 		}
 		ctx.putTyped(o, typ, dst.Interface())
 		for i := 0; i < l; i++ {
-			val := nilSafe(o.self.getIdx(valueInt(i), nil))
-			err = r.toReflectValue(val, dst.Index(i), ctx)
+			var val Value
+			err = ctx.at(ExportIndexPathSegment{Index: i}, func() error {
+				if ex := ctx.trap(ExportErrorKindGetterThrow, typ.Elem(), func() error {
+					val = nilSafe(o.self.getIdx(valueInt(i), nil))
+					return nil
+				}); ex != nil {
+					return ex
+				}
+				return r.toReflectValue(val, dst.Index(i), ctx)
+			})
 			if err != nil {
 				return
 			}

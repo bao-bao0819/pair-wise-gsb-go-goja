@@ -2090,6 +2090,11 @@ func (r *Runtime) wrapReflectFunc(value reflect.Value) func(FunctionCall) Value 
 func (r *Runtime) toReflectValue(v Value, dst reflect.Value, ctx *objectExportCtx) error {
 	typ := dst.Type()
 
+	if v == nil {
+		dst.Set(reflect.Zero(typ))
+		return nil
+	}
+
 	if typ == typeValue {
 		dst.Set(reflect.ValueOf(v))
 		return nil
@@ -2118,7 +2123,13 @@ func (r *Runtime) toReflectValue(v Value, dst reflect.Value, ctx *objectExportCt
 	kind := typ.Kind()
 	for i := 0; ; i++ {
 		if et.AssignableTo(typ) {
-			ev := reflect.ValueOf(exportValue(v, ctx))
+			var ev reflect.Value
+			if err := ctx.trap(ExportErrorKindGetterThrow, typ, func() error {
+				ev = reflect.ValueOf(exportValue(v, ctx))
+				return nil
+			}); err != nil {
+				return err
+			}
 			for ; i > 0; i-- {
 				ev = ev.Elem()
 			}
@@ -2127,7 +2138,13 @@ func (r *Runtime) toReflectValue(v Value, dst reflect.Value, ctx *objectExportCt
 		}
 		expKind := et.Kind()
 		if expKind == kind && et.ConvertibleTo(typ) || expKind == reflect.String && typ == typeBytes {
-			ev := reflect.ValueOf(exportValue(v, ctx))
+			var ev reflect.Value
+			if err := ctx.trap(ExportErrorKindGetterThrow, typ, func() error {
+				ev = reflect.ValueOf(exportValue(v, ctx))
+				return nil
+			}); err != nil {
+				return err
+			}
 			for ; i > 0; i-- {
 				ev = ev.Elem()
 			}
@@ -2151,6 +2168,10 @@ func (r *Runtime) toReflectValue(v Value, dst reflect.Value, ctx *objectExportCt
 		if et.Kind() == reflect.String {
 			tme, ok := dateParse(v.String())
 			if !ok {
+				if ctx.diag != nil {
+					return ctx.newExportError(ExportErrorKindTypeMismatch, typ, nil,
+						fmt.Sprintf("could not convert string %v to %v", v, typ))
+				}
 				return fmt.Errorf("could not convert string %v to %v", v, typ)
 			}
 			dst.Set(reflect.ValueOf(tme))
@@ -2160,53 +2181,44 @@ func (r *Runtime) toReflectValue(v Value, dst reflect.Value, ctx *objectExportCt
 
 	switch kind {
 	case reflect.String:
-		dst.Set(reflect.ValueOf(v.String()).Convert(typ))
-		return nil
+		return r.setReflectString(v, dst, typ, ctx)
 	case reflect.Bool:
-		dst.Set(reflect.ValueOf(v.ToBoolean()).Convert(typ))
-		return nil
+		return r.setReflectBool(v, dst, typ, ctx)
 	case reflect.Int:
-		dst.Set(reflect.ValueOf(toInt(v)).Convert(typ))
-		return nil
+		return r.setReflectInt(v, dst, typ, ctx, func(v Value) int64 { return int64(toInt(v)) })
 	case reflect.Int64:
-		dst.Set(reflect.ValueOf(toInt64(v)).Convert(typ))
-		return nil
+		return r.setReflectInt(v, dst, typ, ctx, toInt64)
 	case reflect.Int32:
-		dst.Set(reflect.ValueOf(toInt32(v)).Convert(typ))
-		return nil
+		return r.setReflectInt(v, dst, typ, ctx, func(v Value) int64 { return int64(toInt32(v)) })
 	case reflect.Int16:
-		dst.Set(reflect.ValueOf(toInt16(v)).Convert(typ))
-		return nil
+		return r.setReflectInt(v, dst, typ, ctx, func(v Value) int64 { return int64(toInt16(v)) })
 	case reflect.Int8:
-		dst.Set(reflect.ValueOf(toInt8(v)).Convert(typ))
-		return nil
+		return r.setReflectInt(v, dst, typ, ctx, func(v Value) int64 { return int64(toInt8(v)) })
 	case reflect.Uint:
-		dst.Set(reflect.ValueOf(toUint(v)).Convert(typ))
-		return nil
+		return r.setReflectUint(v, dst, typ, ctx, func(v Value) uint64 { return uint64(toUint(v)) })
 	case reflect.Uint64:
-		dst.Set(reflect.ValueOf(toUint64(v)).Convert(typ))
-		return nil
+		return r.setReflectUint(v, dst, typ, ctx, toUint64)
 	case reflect.Uint32:
-		dst.Set(reflect.ValueOf(toUint32(v)).Convert(typ))
-		return nil
+		return r.setReflectUint(v, dst, typ, ctx, func(v Value) uint64 { return uint64(toUint32(v)) })
 	case reflect.Uint16:
-		dst.Set(reflect.ValueOf(toUint16(v)).Convert(typ))
-		return nil
+		return r.setReflectUint(v, dst, typ, ctx, func(v Value) uint64 { return uint64(toUint16(v)) })
 	case reflect.Uint8:
-		dst.Set(reflect.ValueOf(toUint8(v)).Convert(typ))
-		return nil
+		return r.setReflectUint(v, dst, typ, ctx, func(v Value) uint64 { return uint64(toUint8(v)) })
 	case reflect.Float64:
-		dst.Set(reflect.ValueOf(v.ToFloat()).Convert(typ))
-		return nil
+		return r.setReflectFloat(v, dst, typ, ctx, 64)
 	case reflect.Float32:
-		dst.Set(reflect.ValueOf(toFloat32(v)).Convert(typ))
-		return nil
+		return r.setReflectFloat(v, dst, typ, ctx, 32)
 	case reflect.Slice, reflect.Array:
 		if o, ok := v.(*Object); ok {
 			if v, exists := ctx.getTyped(o, typ); exists {
 				dst.Set(reflect.ValueOf(v))
 				return nil
 			}
+			if !ctx.enterActive(o) {
+				return ctx.newExportError(ExportErrorKindCycle, typ, nil,
+					fmt.Sprintf("reference cycle cannot be represented by %s", typ))
+			}
+			defer ctx.leaveActive(o)
 			return o.self.exportToArrayOrSlice(dst, typ, ctx)
 		}
 	case reflect.Map:
@@ -2215,6 +2227,11 @@ func (r *Runtime) toReflectValue(v Value, dst reflect.Value, ctx *objectExportCt
 				dst.Set(reflect.ValueOf(v))
 				return nil
 			}
+			if !ctx.enterActive(o) {
+				return ctx.newExportError(ExportErrorKindCycle, typ, nil,
+					fmt.Sprintf("reference cycle cannot be represented by %s", typ))
+			}
+			defer ctx.leaveActive(o)
 			return o.self.exportToMap(dst, typ, ctx)
 		}
 	case reflect.Struct:
@@ -2224,6 +2241,11 @@ func (r *Runtime) toReflectValue(v Value, dst reflect.Value, ctx *objectExportCt
 				dst.Set(reflect.ValueOf(v).Elem())
 				return nil
 			}
+			if !ctx.enterActive(o) {
+				return ctx.newExportError(ExportErrorKindCycle, t, nil,
+					fmt.Sprintf("reference cycle cannot be represented by %s", typ))
+			}
+			defer ctx.leaveActive(o)
 			s := dst
 			ctx.putTyped(o, t, s.Addr().Interface())
 			for i := 0; i < typ.NumField(); i++ {
@@ -2237,12 +2259,21 @@ func (r *Runtime) toReflectValue(v Value, dst reflect.Value, ctx *objectExportCt
 					if field.Anonymous {
 						v = o
 					} else {
-						v = o.self.getStr(unistring.NewFromString(name), nil)
+						var err error
+						v, err = ctx.getStrTrap(o, unistring.NewFromString(name), field.Type)
+						if err != nil {
+							return err
+						}
 					}
 
 					if v != nil {
-						err := r.toReflectValue(v, s.Field(i), ctx)
+						err := ctx.at(ExportPropertyPathSegment{Name: field.Name}, func() error {
+							return r.toReflectValue(v, s.Field(i), ctx)
+						})
 						if err != nil {
+							if ctx.diag != nil {
+								return err
+							}
 							return fmt.Errorf("could not convert struct value %v to %v for field %s: %w", v, field.Type, field.Name, err)
 						}
 					}
@@ -2265,9 +2296,14 @@ func (r *Runtime) toReflectValue(v Value, dst reflect.Value, ctx *objectExportCt
 		if dst.IsNil() {
 			dst.Set(reflect.New(typ.Elem()))
 		}
+		ctx.snapshotPoinee(dst.Elem())
 		return r.toReflectValue(v, dst.Elem(), ctx)
 	}
 
+	if ctx.diag != nil {
+		return ctx.newExportError(ExportErrorKindTypeMismatch, typ, nil,
+			fmt.Sprintf("could not convert %v to %v", v, typ))
+	}
 	return fmt.Errorf("could not convert %v to %v", v, typ)
 }
 
@@ -2405,6 +2441,72 @@ func (r *Runtime) ExportTo(v Value, target interface{}) error {
 		return errors.New("target must be a non-nil pointer")
 	}
 	return r.toReflectValue(v, tval.Elem(), &objectExportCtx{})
+}
+
+// ExportToWithDiagnostics works like ExportTo, but on failure returns an
+// *ExportError describing the exact location and reason of the failure.
+//
+// The returned error's Path contains structured traversal segments (object
+// properties, array indices and Map/Set keys) from the exported value to the
+// value that could not be converted. Property names are returned verbatim, so
+// names containing dots or square brackets cannot be mistaken for path
+// separators. TargetType is the Go type the failing value was converted to and
+// Unwrap (or errors.As) yields the original reason, including the *Exception
+// thrown by a property getter.
+//
+// The Kind field distinguishes integer overflow, unrepresentable numbers (a
+// BigInt that overflows the target floating-point type), type mismatches,
+// exceptions thrown by getters and reference cycles that cannot be
+// represented by the target type. Cycle
+// detection follows the current traversal chain: the same object referenced
+// from two independent fields is not a cycle and remains a shared alias. When
+// the target type can preserve aliases (maps, slices, pointers and
+// interface{} values) circular and shared references are retained using the
+// same rules as ExportTo.
+//
+// Numeric conversions follow the same ECMAScript rules as ExportTo (including
+// wrap-around truncation as per ToInt32 and friends); only values that cannot
+// be represented at all, or BigInts that do not fit into the target integer
+// type, are reported as errors.
+//
+// On failure target is left exactly as it was before the call: its original
+// contents are snapshotted and restored when any value fails to convert, so
+// partially converted fields are never observable.
+func (r *Runtime) ExportToWithDiagnostics(v Value, target interface{}) error {
+	tval := reflect.ValueOf(target)
+	if tval.Kind() != reflect.Ptr || tval.IsNil() {
+		return errors.New("target must be a non-nil pointer")
+	}
+	dst := tval.Elem()
+	ctx := &objectExportCtx{diag: &diagnosticExportCtx{}}
+
+	// Convert in place into the caller's destination, but remember its original
+	// contents so a failure leaves the target byte-for-byte untouched. The
+	// in-place conversion is what allows self-referential pointers and maps to
+	// remain true aliases (the cached value must keep pointing at the final
+	// destination).
+	ctx.snapshotRoot(dst)
+	err := func() (err error) {
+		defer func() {
+			if rec := recover(); rec != nil {
+				if e, ok := rec.(*ExportError); ok {
+					err = e
+					return
+				}
+				if ex, ok := rec.(*Exception); ok {
+					err = ctx.newExportError(ExportErrorKindGetterThrow, dst.Type(), ex, "")
+					return
+				}
+				err = ctx.newExportError(ExportErrorKindUnspecified, dst.Type(), nil, fmt.Sprint(rec))
+			}
+		}()
+		return r.toReflectValue(v, dst, ctx)
+	}()
+	if err != nil {
+		ctx.restoreSnapshots()
+		return err
+	}
+	return nil
 }
 
 // GlobalObject returns the global object.

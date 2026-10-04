@@ -188,6 +188,14 @@ fmt.Println(sum(40, 2)) // note, _this_ value in the function will be undefined.
 // Output: 42
 ```
 
+When exporting deep objects it can be useful to know exactly which element or
+field failed and why. [Runtime.ExportToWithDiagnostics()](https://pkg.go.dev/github.com/dop251/goja#Runtime.ExportToWithDiagnostics)
+works like `ExportTo`, but on failure returns an `*ExportError` containing the
+structured property/index path, the target Go type and the original cause (for
+example a thrown exception, available via `errors.As`/`Unwrap`). The target is
+left unchanged on failure, and reference aliases are retained whenever the
+target type can represent them.
+
 The first one is more low level and allows specifying _this_ value, whereas the second one makes the function look like
 a normal Go function.
 

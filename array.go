@@ -525,6 +525,10 @@ func (a *arrayObject) exportToArrayOrSlice(dst reflect.Value, typ reflect.Type, 
 		l := toIntStrict(int64(a.length))
 		if typ.Kind() == reflect.Array {
 			if dst.Len() != l {
+				if ctx.diag != nil {
+					return ctx.newExportError(ExportErrorKindUnspecified, typ, nil,
+						fmt.Sprintf("cannot convert an Array into an array, lengths mismatch (have %d, need %d)", l, dst.Len()))
+				}
 				return fmt.Errorf("cannot convert an Array into an array, lengths mismatch (have %d, need %d)", l, dst.Len())
 			}
 		} else {
@@ -536,11 +540,18 @@ func (a *arrayObject) exportToArrayOrSlice(dst reflect.Value, typ reflect.Type, 
 				break
 			}
 			val := a.values[i]
-			if p, ok := val.(*valueProperty); ok {
-				val = p.get(a.val)
-			}
-			err := r.toReflectValue(val, dst.Index(i), ctx)
+			err := ctx.at(ExportIndexPathSegment{Index: i}, func() error {
+				return ctx.trap(ExportErrorKindGetterThrow, typ.Elem(), func() error {
+					if p, ok := val.(*valueProperty); ok {
+						val = p.get(a.val)
+					}
+					return r.toReflectValue(val, dst.Index(i), ctx)
+				})
+			})
 			if err != nil {
+				if ctx.diag != nil {
+					return err
+				}
 				return fmt.Errorf("could not convert array element %v to %v at %d: %w", val, typ, i, err)
 			}
 		}
