@@ -21,6 +21,8 @@ Features
  * Capable of running Babel, Typescript compiler and pretty much anything written in ES5.
  * Sourcemaps.
  * Most of ES6 functionality, still work in progress, see https://github.com/dop251/goja/milestone/1?closed=1
+ * Scoped static ES modules (`import`/`export` with live bindings, TDZ and circular imports) via the
+   host-driven `ModuleLoader`, see [module.md](module.md). Ordinary scripts are unaffected.
 
 Known incompatibilities and caveats
 -----------------------------------

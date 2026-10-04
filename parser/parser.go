@@ -49,6 +49,7 @@ type Mode uint
 
 const (
 	IgnoreRegExpErrors Mode = 1 << iota // Ignore RegExp compatibility errors (allow backtracking)
+	ModuleMode                          // Parse the source as an ECMAScript module (import/export)
 )
 
 type options struct {
@@ -107,6 +108,8 @@ type _parser struct {
 	mode Mode
 	opts options
 
+	module bool // true when parsing in ModuleMode
+
 	file *file.File
 }
 
@@ -164,6 +167,20 @@ func ReadSource(filename string, src interface{}) ([]byte, error) {
 //	// Parse some JavaScript, yielding a *ast.Program and/or an ErrorList
 //	program, err := parser.ParseFile(nil, "", `if (abc > 1) {}`, 0)
 func ParseFile(fileSet *file.FileSet, filename string, src interface{}, mode Mode, options ...Option) (*ast.Program, error) {
+	return parseFile(fileSet, filename, src, mode, false, options...)
+}
+
+// ParseModule parses the source code of a single ECMAScript module and returns
+// the corresponding ast.Program node. Unlike ParseFile, import and export
+// statements are recognised. The resulting AST still requires a module-aware
+// consumer (e.g. goja's ModuleLoader); a plain Script run does not accept it.
+//
+// src may be a string, a byte slice, a bytes.Buffer, or an io.Reader, but it MUST always be in UTF-8.
+func ParseModule(fileSet *file.FileSet, filename string, src interface{}, options ...Option) (*ast.Program, error) {
+	return parseFile(fileSet, filename, src, IgnoreRegExpErrors, true, options...)
+}
+
+func parseFile(fileSet *file.FileSet, filename string, src interface{}, mode Mode, isModule bool, options ...Option) (*ast.Program, error) {
 	str, err := ReadSource(filename, src)
 	if err != nil {
 		return nil, err
@@ -178,6 +195,7 @@ func ParseFile(fileSet *file.FileSet, filename string, src interface{}, mode Mod
 
 		parser := _newParser(filename, str, base, options...)
 		parser.mode = mode
+		parser.module = isModule
 		return parser.parse()
 	}
 }
@@ -214,6 +232,9 @@ func (self *_parser) parse() (*ast.Program, error) {
 	defer self.closeScope()
 	self.next()
 	program := self.parseProgram()
+	if self.module {
+		self.checkModuleBody(program)
+	}
 	if false {
 		self.errors.Sort()
 	}

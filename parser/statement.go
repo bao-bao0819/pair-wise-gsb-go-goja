@@ -902,7 +902,13 @@ func (self *_parser) parseIfStatement() ast.Statement {
 func (self *_parser) parseSourceElements() (body []ast.Statement) {
 	for self.token != token.EOF {
 		self.scope.allowLet = true
-		body = append(body, self.parseStatement())
+		if self.module && self.isImportToken() {
+			body = append(body, self.parseImportDeclaration())
+		} else if self.module && self.isExportToken() {
+			body = append(body, self.parseExportDeclaration())
+		} else {
+			body = append(body, self.parseStatement())
+		}
 	}
 
 	return body

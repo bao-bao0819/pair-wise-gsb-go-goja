@@ -490,34 +490,80 @@ type (
 	ClassDeclaration struct {
 		Class *ClassLiteral
 	}
+
+	// ImportDeclaration represents a static import statement:
+	// import defaultName, { a as b } from "specifier";
+	// The Module field contains the string literal module specifier as written
+	// in the source (before any host resolution).
+	ImportDeclaration struct {
+		Idx     file.Idx // position of the "import" keyword
+		Module  *StringLiteral
+		Default *Identifier // imported default binding, if any
+		List    []ImportSpecifier
+	}
+
+	// ImportSpecifier is a single named import clause: importedName as localName.
+	// ExportName is "default" when importing the default export by name.
+	ImportSpecifier struct {
+		Imported *Identifier // name exported by the source module
+		Local    *Identifier // binding created in this module
+	}
+
+	// ExportNamedDeclaration represents a static named export:
+	// export let/const/var ..., export function/class ..., export { a as b },
+	// and export { a as b } from "specifier" (explicit re-export).
+	ExportNamedDeclaration struct {
+		Idx         file.Idx // position of the "export" keyword
+		Declaration Statement
+		List        []ExportSpecifier
+		Module      *StringLiteral // non-nil for re-exports
+	}
+
+	// ExportSpecifier is a single export clause: localName as exportedName,
+	// or importedName as exportedName when part of a re-export.
+	ExportSpecifier struct {
+		Local    *Identifier // local binding (nil for re-exports using a string name)
+		Exported *Identifier // public export name ("default" allowed)
+	}
+
+	// ExportDefaultDeclaration represents: export default <expression|function|class>.
+	ExportDefaultDeclaration struct {
+		Idx         file.Idx   // position of the "export" keyword
+		Default     file.Idx   // position of the "default" keyword
+		Declaration Statement  // *FunctionDeclaration or *ClassDeclaration, may be nil
+		Value       Expression // used when Declaration is nil
+	}
 )
 
 // _statementNode
 
-func (*BadStatement) _statementNode()        {}
-func (*BlockStatement) _statementNode()      {}
-func (*BranchStatement) _statementNode()     {}
-func (*CaseStatement) _statementNode()       {}
-func (*CatchStatement) _statementNode()      {}
-func (*DebuggerStatement) _statementNode()   {}
-func (*DoWhileStatement) _statementNode()    {}
-func (*EmptyStatement) _statementNode()      {}
-func (*ExpressionStatement) _statementNode() {}
-func (*ForInStatement) _statementNode()      {}
-func (*ForOfStatement) _statementNode()      {}
-func (*ForStatement) _statementNode()        {}
-func (*IfStatement) _statementNode()         {}
-func (*LabelledStatement) _statementNode()   {}
-func (*ReturnStatement) _statementNode()     {}
-func (*SwitchStatement) _statementNode()     {}
-func (*ThrowStatement) _statementNode()      {}
-func (*TryStatement) _statementNode()        {}
-func (*VariableStatement) _statementNode()   {}
-func (*WhileStatement) _statementNode()      {}
-func (*WithStatement) _statementNode()       {}
-func (*LexicalDeclaration) _statementNode()  {}
-func (*FunctionDeclaration) _statementNode() {}
-func (*ClassDeclaration) _statementNode()    {}
+func (*BadStatement) _statementNode()             {}
+func (*BlockStatement) _statementNode()           {}
+func (*BranchStatement) _statementNode()          {}
+func (*CaseStatement) _statementNode()            {}
+func (*CatchStatement) _statementNode()           {}
+func (*DebuggerStatement) _statementNode()        {}
+func (*DoWhileStatement) _statementNode()         {}
+func (*EmptyStatement) _statementNode()           {}
+func (*ExpressionStatement) _statementNode()      {}
+func (*ForInStatement) _statementNode()           {}
+func (*ForOfStatement) _statementNode()           {}
+func (*ForStatement) _statementNode()             {}
+func (*IfStatement) _statementNode()              {}
+func (*LabelledStatement) _statementNode()        {}
+func (*ReturnStatement) _statementNode()          {}
+func (*SwitchStatement) _statementNode()          {}
+func (*ThrowStatement) _statementNode()           {}
+func (*TryStatement) _statementNode()             {}
+func (*VariableStatement) _statementNode()        {}
+func (*WhileStatement) _statementNode()           {}
+func (*WithStatement) _statementNode()            {}
+func (*LexicalDeclaration) _statementNode()       {}
+func (*FunctionDeclaration) _statementNode()      {}
+func (*ClassDeclaration) _statementNode()         {}
+func (*ImportDeclaration) _statementNode()        {}
+func (*ExportNamedDeclaration) _statementNode()   {}
+func (*ExportDefaultDeclaration) _statementNode() {}
 
 // =========== //
 // Declaration //
@@ -681,32 +727,35 @@ func (self *UnaryExpression) Idx0() file.Idx {
 }
 func (self *MetaProperty) Idx0() file.Idx { return self.Idx }
 
-func (self *BadStatement) Idx0() file.Idx        { return self.From }
-func (self *BlockStatement) Idx0() file.Idx      { return self.LeftBrace }
-func (self *BranchStatement) Idx0() file.Idx     { return self.Idx }
-func (self *CaseStatement) Idx0() file.Idx       { return self.Case }
-func (self *CatchStatement) Idx0() file.Idx      { return self.Catch }
-func (self *DebuggerStatement) Idx0() file.Idx   { return self.Debugger }
-func (self *DoWhileStatement) Idx0() file.Idx    { return self.Do }
-func (self *EmptyStatement) Idx0() file.Idx      { return self.Semicolon }
-func (self *ExpressionStatement) Idx0() file.Idx { return self.Expression.Idx0() }
-func (self *ForInStatement) Idx0() file.Idx      { return self.For }
-func (self *ForOfStatement) Idx0() file.Idx      { return self.For }
-func (self *ForStatement) Idx0() file.Idx        { return self.For }
-func (self *IfStatement) Idx0() file.Idx         { return self.If }
-func (self *LabelledStatement) Idx0() file.Idx   { return self.Label.Idx0() }
-func (self *Program) Idx0() file.Idx             { return self.Body[0].Idx0() }
-func (self *ReturnStatement) Idx0() file.Idx     { return self.Return }
-func (self *SwitchStatement) Idx0() file.Idx     { return self.Switch }
-func (self *ThrowStatement) Idx0() file.Idx      { return self.Throw }
-func (self *TryStatement) Idx0() file.Idx        { return self.Try }
-func (self *VariableStatement) Idx0() file.Idx   { return self.Var }
-func (self *WhileStatement) Idx0() file.Idx      { return self.While }
-func (self *WithStatement) Idx0() file.Idx       { return self.With }
-func (self *LexicalDeclaration) Idx0() file.Idx  { return self.Idx }
-func (self *FunctionDeclaration) Idx0() file.Idx { return self.Function.Idx0() }
-func (self *ClassDeclaration) Idx0() file.Idx    { return self.Class.Idx0() }
-func (self *Binding) Idx0() file.Idx             { return self.Target.Idx0() }
+func (self *BadStatement) Idx0() file.Idx             { return self.From }
+func (self *BlockStatement) Idx0() file.Idx           { return self.LeftBrace }
+func (self *BranchStatement) Idx0() file.Idx          { return self.Idx }
+func (self *CaseStatement) Idx0() file.Idx            { return self.Case }
+func (self *CatchStatement) Idx0() file.Idx           { return self.Catch }
+func (self *DebuggerStatement) Idx0() file.Idx        { return self.Debugger }
+func (self *DoWhileStatement) Idx0() file.Idx         { return self.Do }
+func (self *EmptyStatement) Idx0() file.Idx           { return self.Semicolon }
+func (self *ExpressionStatement) Idx0() file.Idx      { return self.Expression.Idx0() }
+func (self *ForInStatement) Idx0() file.Idx           { return self.For }
+func (self *ForOfStatement) Idx0() file.Idx           { return self.For }
+func (self *ForStatement) Idx0() file.Idx             { return self.For }
+func (self *IfStatement) Idx0() file.Idx              { return self.If }
+func (self *LabelledStatement) Idx0() file.Idx        { return self.Label.Idx0() }
+func (self *Program) Idx0() file.Idx                  { return self.Body[0].Idx0() }
+func (self *ReturnStatement) Idx0() file.Idx          { return self.Return }
+func (self *SwitchStatement) Idx0() file.Idx          { return self.Switch }
+func (self *ThrowStatement) Idx0() file.Idx           { return self.Throw }
+func (self *TryStatement) Idx0() file.Idx             { return self.Try }
+func (self *VariableStatement) Idx0() file.Idx        { return self.Var }
+func (self *WhileStatement) Idx0() file.Idx           { return self.While }
+func (self *WithStatement) Idx0() file.Idx            { return self.With }
+func (self *LexicalDeclaration) Idx0() file.Idx       { return self.Idx }
+func (self *FunctionDeclaration) Idx0() file.Idx      { return self.Function.Idx0() }
+func (self *ClassDeclaration) Idx0() file.Idx         { return self.Class.Idx0() }
+func (self *ImportDeclaration) Idx0() file.Idx        { return self.Idx }
+func (self *ExportNamedDeclaration) Idx0() file.Idx   { return self.Idx }
+func (self *ExportDefaultDeclaration) Idx0() file.Idx { return self.Idx }
+func (self *Binding) Idx0() file.Idx                  { return self.Target.Idx0() }
 
 func (self *ForLoopInitializerExpression) Idx0() file.Idx  { return self.Expression.Idx0() }
 func (self *ForLoopInitializerVarDeclList) Idx0() file.Idx { return self.List[0].Idx0() }
@@ -822,6 +871,30 @@ func (self *WithStatement) Idx1() file.Idx       { return self.Body.Idx1() }
 func (self *LexicalDeclaration) Idx1() file.Idx  { return self.List[len(self.List)-1].Idx1() }
 func (self *FunctionDeclaration) Idx1() file.Idx { return self.Function.Idx1() }
 func (self *ClassDeclaration) Idx1() file.Idx    { return self.Class.Idx1() }
+func (self *ImportDeclaration) Idx1() file.Idx {
+	if self.Module != nil {
+		return self.Module.Idx1()
+	}
+	return self.Idx + 6
+}
+func (self *ExportNamedDeclaration) Idx1() file.Idx {
+	if self.Module != nil {
+		return self.Module.Idx1()
+	}
+	if len(self.List) > 0 {
+		return self.List[len(self.List)-1].Exported.Idx1()
+	}
+	if self.Declaration != nil {
+		return self.Declaration.Idx1()
+	}
+	return self.Idx + 6
+}
+func (self *ExportDefaultDeclaration) Idx1() file.Idx {
+	if self.Declaration != nil {
+		return self.Declaration.Idx1()
+	}
+	return self.Value.Idx1()
+}
 func (self *Binding) Idx1() file.Idx {
 	if self.Initializer != nil {
 		return self.Initializer.Idx1()
