@@ -2288,6 +2288,9 @@ func (c *compiler) emitLoadThis() {
 	} else {
 		if eval {
 			c.emit(getThisDynamic{})
+		} else if s := c.scope; s.isModule && s.outer != nil && s.outer.outer == nil {
+			// ES module top-level 'this' is undefined.
+			c.emit(loadUndef)
 		} else {
 			c.emit(loadGlobalObject)
 		}

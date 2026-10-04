@@ -38,6 +38,7 @@ type context struct {
 	prg       *Program
 	stash     *stash
 	privEnv   *privateEnv
+	moduleEnv *moduleEnvironment
 	newTarget Value
 	result    Value
 	pc, sb    int
@@ -365,14 +366,18 @@ type vm struct {
 	stack        valueStack
 	sp, sb, args int
 
-	stash     *stash
-	privEnv   *privateEnv
-	callStack []context
-	iterStack []iterStackItem
-	refStack  []ref
-	tryStack  []tryFrame
-	newTarget Value
-	result    Value
+	stash   *stash
+	privEnv *privateEnv
+	// moduleEnv is the environment of the module currently being evaluated.
+	moduleEnv *moduleEnvironment
+	// pendingModuleEnv is installed by the next enterModule instruction.
+	pendingModuleEnv *moduleEnvironment
+	callStack        []context
+	iterStack        []iterStackItem
+	refStack         []ref
+	tryStack         []tryFrame
+	newTarget        Value
+	result           Value
 
 	maxCallStackSize int
 
@@ -634,7 +639,11 @@ func (vm *vm) run() {
 		if pc < 0 || pc >= len(vm.prg.code) {
 			break
 		}
-		vm.prg.code[pc].exec(vm)
+		in := vm.prg.code[pc]
+		if in == nil {
+			panic(fmt.Sprintf("nil instruction at pc=%d", pc))
+		}
+		in.exec(vm)
 	}
 
 	if interrupted {
@@ -908,6 +917,7 @@ func (vm *vm) peek() Value {
 func (vm *vm) saveCtx(ctx *context) {
 	ctx.prg, ctx.stash, ctx.privEnv, ctx.newTarget, ctx.result, ctx.pc, ctx.sb, ctx.args =
 		vm.prg, vm.stash, vm.privEnv, vm.newTarget, vm.result, vm.pc, vm.sb, vm.args
+	ctx.moduleEnv = vm.moduleEnv
 }
 
 func (vm *vm) pushCtx() {
@@ -924,6 +934,7 @@ func (vm *vm) pushCtx() {
 func (vm *vm) restoreCtx(ctx *context) {
 	vm.prg, vm.stash, vm.privEnv, vm.newTarget, vm.result, vm.pc, vm.sb, vm.args =
 		ctx.prg, ctx.stash, ctx.privEnv, ctx.newTarget, ctx.result, ctx.pc, ctx.sb, ctx.args
+	vm.moduleEnv = ctx.moduleEnv
 }
 
 func (vm *vm) popCtx() {
@@ -3967,6 +3978,7 @@ func (n *newFunc) exec(vm *vm) {
 	obj.prg = n.prg
 	obj.stash = vm.stash
 	obj.privEnv = vm.privEnv
+	obj.moduleEnv = vm.moduleEnv
 	obj.src = n.source
 	vm.push(obj.val)
 	vm.pc++
@@ -3985,6 +3997,7 @@ func (n *newAsyncFunc) exec(vm *vm) {
 	obj.prg = n.prg
 	obj.stash = vm.stash
 	obj.privEnv = vm.privEnv
+	obj.moduleEnv = vm.moduleEnv
 	obj.src = n.source
 	vm.push(obj.val)
 	vm.pc++
@@ -3999,6 +4012,7 @@ func (n *newGeneratorFunc) exec(vm *vm) {
 	obj.prg = n.prg
 	obj.stash = vm.stash
 	obj.privEnv = vm.privEnv
+	obj.moduleEnv = vm.moduleEnv
 	obj.src = n.source
 	vm.push(obj.val)
 	vm.pc++
@@ -4013,6 +4027,7 @@ func (n *newMethod) _exec(vm *vm, obj *methodFuncObject) {
 	obj.prg = n.prg
 	obj.stash = vm.stash
 	obj.privEnv = vm.privEnv
+	obj.moduleEnv = vm.moduleEnv
 	obj.src = n.source
 	if n.homeObjOffset > 0 {
 		obj.homeObject = vm.r.toObject(vm.stack[vm.sp-int(n.homeObjOffset)])
@@ -4088,6 +4103,7 @@ func (n *newArrowFunc) _exec(vm *vm, obj *arrowFuncObject) {
 	obj.prg = n.prg
 	obj.stash = vm.stash
 	obj.privEnv = vm.privEnv
+	obj.moduleEnv = vm.moduleEnv
 	obj.src = n.source
 	if vm.sb > 0 {
 		obj.funcObj = getFuncObject(vm.stack[vm.sb-1])
@@ -5493,6 +5509,7 @@ func (c *newClass) create(protoParent, ctorParent *Object, vm *vm, derived bool)
 	proto._putProp("constructor", f.val, true, false, true)
 	f.prg = c.ctor
 	f.stash = vm.stash
+	f.moduleEnv = vm.moduleEnv
 	f.src = c.source
 	f.initFields = c.initFields
 	if c.hasPrivateEnv {

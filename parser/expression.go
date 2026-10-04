@@ -97,6 +97,19 @@ func (self *_parser) parsePrimaryExpression() ast.Expression {
 		return self.parseClass(false)
 	}
 
+	if self.module && self.token == token.KEYWORD {
+		switch self.literal {
+		case "import":
+			if self.peek() == token.PERIOD {
+				self.error(idx, "import.meta is not supported in module v1")
+			} else {
+				self.error(idx, "dynamic import() is not supported in module v1")
+			}
+		case "await":
+			self.error(idx, "top-level await is not supported in module v1")
+		}
+	}
+
 	if self.isBindingId(self.token) {
 		self.next()
 		return &ast.Identifier{

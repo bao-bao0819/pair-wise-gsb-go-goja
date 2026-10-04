@@ -67,6 +67,9 @@ type baseJsFuncObject struct {
 
 	stash   *stash
 	privEnv *privateEnv
+	// moduleEnv is the module environment this function closes over. It is
+	// nil for functions declared in ordinary scripts.
+	moduleEnv *moduleEnvironment
 
 	prg    *Program
 	src    string
@@ -431,6 +434,7 @@ func (f *baseJsFuncObject) __call(args []Value, newTarget, this Value) (Value, *
 	vm.prg = f.prg
 	vm.stash = f.stash
 	vm.privEnv = f.privEnv
+	vm.moduleEnv = f.moduleEnv
 	vm.newTarget = newTarget
 	vm.pc = 0
 	for {
@@ -487,6 +491,7 @@ func (f *baseJsFuncObject) vmCall(vm *vm, n int) {
 	vm.prg = f.prg
 	vm.stash = f.stash
 	vm.privEnv = f.privEnv
+	vm.moduleEnv = f.moduleEnv
 	vm.pc = 0
 	vm.stack[vm.sp-n-1], vm.stack[vm.sp-n-2] = vm.stack[vm.sp-n-2], vm.stack[vm.sp-n-1]
 }
@@ -501,6 +506,7 @@ func (f *arrowFuncObject) vmCall(vm *vm, n int) {
 	vm.prg = f.prg
 	vm.stash = f.stash
 	vm.privEnv = f.privEnv
+	vm.moduleEnv = f.moduleEnv
 	vm.pc = 0
 	vm.stack[vm.sp-n-1], vm.stack[vm.sp-n-2] = nil, vm.stack[vm.sp-n-1]
 	vm.newTarget = f.newTarget

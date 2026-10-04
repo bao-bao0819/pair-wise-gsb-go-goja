@@ -549,6 +549,9 @@ func (self *_parser) parseSwitchStatement() ast.Statement {
 }
 
 func (self *_parser) parseWithStatement() ast.Statement {
+	if self.module {
+		self.error(self.idx, "'with' statements are not allowed in modules")
+	}
 	node := &ast.WithStatement{}
 	node.With = self.expect(token.WITH)
 	self.expect(token.LEFT_PARENTHESIS)

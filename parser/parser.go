@@ -107,6 +107,9 @@ type _parser struct {
 	mode Mode
 	opts options
 
+	// module is true when parsing an ES module (see ParseModule).
+	module bool
+
 	file *file.File
 }
 

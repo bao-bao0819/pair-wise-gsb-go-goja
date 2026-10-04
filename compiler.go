@@ -73,6 +73,10 @@ type Program struct {
 	funcName unistring.String
 	src      *file.File
 	srcMap   []srcMapItem
+
+	// moduleMeta is populated for programs compiled from ES modules. It is
+	// nil for ordinary scripts and functions.
+	moduleMeta *moduleMeta
 }
 
 type compiler struct {
@@ -101,6 +105,18 @@ type binding struct {
 	isArg        bool
 	isVar        bool
 	inStash      bool
+
+	// isModuleCell marks a module top-level binding (own export or import).
+	// Such a binding is allocated in the module environment's cells vector
+	// rather than in the usual stack/stash layout, so that the cell can be
+	// shared live with importing modules.
+	isModuleCell bool
+	// moduleCell is the index in the module record's cells vector. Valid
+	// only when isModuleCell is true.
+	moduleCell int
+	// isImport marks a binding introduced by an import statement. Such
+	// bindings are immutable and their cell is owned by another module.
+	isImport bool
 }
 
 func (b *binding) getAccessPointsForScope(s *scope) *[]int {
@@ -134,6 +150,15 @@ func (b *binding) markAccessPoint() {
 }
 
 func (b *binding) emitGet() {
+	if b.isModuleCell {
+		b.markAccessPoint()
+		if b.isVar && !b.isArg {
+			b.scope.c.emit(loadCell{cell: b.moduleCell})
+		} else {
+			b.scope.c.emit(loadCellLex{cell: b.moduleCell})
+		}
+		return
+	}
 	b.markAccessPoint()
 	if b.isVar && !b.isArg {
 		b.scope.c.emit(loadStack(0))
@@ -152,6 +177,15 @@ func (b *binding) emitGetAt(pos int) {
 }
 
 func (b *binding) emitGetP() {
+	if b.isModuleCell {
+		if b.isVar && !b.isArg {
+			// vars are initialised to undefined: no TDZ check needed
+		} else {
+			b.markAccessPoint()
+			b.scope.c.emit(loadCellLex{cell: b.moduleCell}, pop)
+		}
+		return
+	}
 	if b.isVar && !b.isArg {
 		// no-op
 	} else {
@@ -162,6 +196,18 @@ func (b *binding) emitGetP() {
 }
 
 func (b *binding) emitSet() {
+	if b.isModuleCell {
+		if b.isImport {
+			b.scope.c.throwSyntaxErrorf(0, "Cannot assign to imported binding '%s'", b.name.String())
+		}
+		if b.isConst {
+			b.scope.c.emit(throwAssignToConst)
+		} else {
+			b.markAccessPoint()
+			b.scope.c.emit(storeCell{cell: b.moduleCell})
+		}
+		return
+	}
 	if b.isConst {
 		if b.isStrict || b.scope.c.scope.strict {
 			b.scope.c.emit(throwAssignToConst)
@@ -177,6 +223,18 @@ func (b *binding) emitSet() {
 }
 
 func (b *binding) emitSetP() {
+	if b.isModuleCell {
+		if b.isImport {
+			b.scope.c.throwSyntaxErrorf(0, "Cannot assign to imported binding '%s'", b.name.String())
+		}
+		if b.isConst {
+			b.scope.c.emit(throwAssignToConst)
+		} else {
+			b.markAccessPoint()
+			b.scope.c.emit(storeCellP{cell: b.moduleCell})
+		}
+		return
+	}
 	if b.isConst {
 		if b.isStrict || b.scope.c.scope.strict {
 			b.scope.c.emit(throwAssignToConst)
@@ -192,6 +250,11 @@ func (b *binding) emitSetP() {
 }
 
 func (b *binding) emitInitP() {
+	if b.isModuleCell {
+		b.markAccessPoint()
+		b.scope.c.emit(initCellP{cell: b.moduleCell})
+		return
+	}
 	if !b.isVar && b.scope.outer == nil {
 		b.scope.c.emit(initGlobalP(b.name))
 	} else {
@@ -201,6 +264,11 @@ func (b *binding) emitInitP() {
 }
 
 func (b *binding) emitInit() {
+	if b.isModuleCell {
+		b.markAccessPoint()
+		b.scope.c.emit(initCell{cell: b.moduleCell})
+		return
+	}
 	if !b.isVar && b.scope.outer == nil {
 		b.scope.c.emit(initGlobal(b.name))
 	} else {
@@ -310,6 +378,9 @@ type scope struct {
 	argsInStash bool
 	// need 'arguments' object (functions only)
 	argsNeeded bool
+
+	// isModule is true for the top-level scope of an ES module.
+	isModule bool
 }
 
 type block struct {
@@ -568,7 +639,7 @@ func (s *scope) createThisBinding() *binding {
 }
 
 func (s *scope) bindName(name unistring.String) (*binding, bool) {
-	if !s.isFunction() && !s.variable && s.outer != nil {
+	if !s.isFunction() && !s.variable && !s.isModule && s.outer != nil {
 		return s.outer.bindName(name)
 	}
 	b, created := s.bindNameLexical(name, false, 0)
@@ -579,7 +650,7 @@ func (s *scope) bindName(name unistring.String) (*binding, bool) {
 }
 
 func (s *scope) bindNameShadow(name unistring.String) (*binding, bool) {
-	if !s.isFunction() && s.outer != nil {
+	if !s.isFunction() && !s.isModule && s.outer != nil {
 		return s.outer.bindNameShadow(name)
 	}
 
@@ -1110,6 +1181,11 @@ func (c *compiler) createVarIdBinding(name unistring.String, offset int, inFunc 
 		c.checkIdentifierLName(name, offset)
 		c.checkIdentifierName(name, offset)
 	}
+	if c.scope.isModule {
+		// Module var names were pre-bound during the module declaration
+		// scan; do not create a second binding here.
+		return
+	}
 	if !inFunc || name != "arguments" {
 		c.scope.bindName(name)
 	}
@@ -1260,6 +1336,11 @@ func (c *compiler) compileFunction(v *ast.FunctionDeclaration) {
 }
 
 func (c *compiler) compileStandaloneFunctionDecl(v *ast.FunctionDeclaration) {
+	if c.scope.isModule {
+		// Top-level function declarations in modules are hoisted and
+		// compiled by the module compiler, not the generic statement path.
+		return
+	}
 	if v.Function.Async {
 		c.throwSyntaxError(int(v.Idx0())-1, "Async functions can only be declared at top level or inside a block.")
 	}
@@ -1267,6 +1348,9 @@ func (c *compiler) compileStandaloneFunctionDecl(v *ast.FunctionDeclaration) {
 		c.throwSyntaxError(int(v.Idx0())-1, "Generators can only be declared at top level or inside a block.")
 	}
 	if c.scope.strict {
+		if c.scope.isModule {
+			return
+		}
 		c.throwSyntaxError(int(v.Idx0())-1, "In strict mode code, functions can only be declared at top level or inside a block.")
 	}
 	c.throwSyntaxError(int(v.Idx0())-1, "In non-strict mode code, functions can only be declared at top level, inside a block, or as the body of an if statement.")
