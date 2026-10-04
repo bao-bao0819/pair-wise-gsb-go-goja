@@ -14,6 +14,7 @@ type objectGoSlice struct {
 	data       *[]interface{}
 	lengthProp valueProperty
 	origIsPtr  bool
+	readOnly   *readOnlyContext
 }
 
 func (r *Runtime) newObjectGoSlice(data *[]interface{}, isPtr bool) *objectGoSlice {
@@ -40,11 +41,22 @@ func (o *objectGoSlice) init() {
 	o.baseObject._put("length", &o.lengthProp)
 }
 
+func (o *objectGoSlice) enableReadOnly(ctx *readOnlyContext) {
+	o.readOnly = ctx
+	o.extensible = false
+	o.updateLen()
+	o.lengthProp.writable = false
+	o.lengthProp.configurable = false
+}
+
 func (o *objectGoSlice) updateLen() {
 	o.lengthProp.value = intToValue(int64(len(*o.data)))
 }
 
 func (o *objectGoSlice) _getIdx(idx int) Value {
+	if o.readOnly != nil {
+		return o.readOnly.child((*o.data)[idx], reflect.Value{})
+	}
 	return o.val.runtime.ToValue((*o.data)[idx])
 }
 
@@ -78,7 +90,7 @@ func (o *objectGoSlice) getOwnPropStr(name unistring.String) Value {
 		if idx < len(*o.data) {
 			return &valueProperty{
 				value:      o._getIdx(idx),
-				writable:   true,
+				writable:   o.readOnly == nil,
 				enumerable: true,
 			}
 		}
@@ -95,7 +107,7 @@ func (o *objectGoSlice) getOwnPropIdx(idx valueInt) Value {
 	if idx := int64(idx); idx >= 0 && idx < int64(len(*o.data)) {
 		return &valueProperty{
 			value:      o._getIdx(int(idx)),
-			writable:   true,
+			writable:   o.readOnly == nil,
 			enumerable: true,
 		}
 	}
@@ -147,6 +159,9 @@ func (o *objectGoSlice) putLength(v uint32, throw bool) bool {
 }
 
 func (o *objectGoSlice) setOwnIdx(idx valueInt, val Value, throw bool) bool {
+	if o.readOnly != nil {
+		return o.readOnly.rejectReadOnlyWrite(throw, "assign to property "+idx.string())
+	}
 	if i := toIntStrict(int64(idx)); i >= 0 {
 		if i >= len(*o.data) {
 			if res, ok := o._setForeignIdx(idx, nil, val, o.val, throw); ok {
@@ -168,6 +183,9 @@ func (o *objectGoSlice) setOwnIdx(idx valueInt, val Value, throw bool) bool {
 
 func (o *objectGoSlice) setOwnStr(name unistring.String, val Value, throw bool) bool {
 	if idx := strToGoIdx(name); idx >= 0 {
+		if o.readOnly != nil {
+			return o.readOnly.rejectReadOnlyWrite(throw, "assign to property "+name)
+		}
 		if idx >= len(*o.data) {
 			if res, ok := o._setForeignStr(name, nil, val, o.val, throw); ok {
 				return res
@@ -176,6 +194,9 @@ func (o *objectGoSlice) setOwnStr(name unistring.String, val Value, throw bool) 
 		o.putIdx(idx, val, throw)
 	} else {
 		if name == "length" {
+			if o.readOnly != nil {
+				return o.readOnly.rejectReadOnlyWrite(throw, "set length")
+			}
 			return o.putLength(o.val.runtime.toLengthUint32(val), throw)
 		}
 		if res, ok := o._setForeignStr(name, nil, val, o.val, throw); !ok {
@@ -189,10 +210,18 @@ func (o *objectGoSlice) setOwnStr(name unistring.String, val Value, throw bool) 
 }
 
 func (o *objectGoSlice) setForeignIdx(idx valueInt, val, receiver Value, throw bool) (bool, bool) {
+	if o.readOnly != nil {
+		o.readOnly.rejectReadOnlyWrite(throw, "assign to property "+idx.string())
+		return false, true
+	}
 	return o._setForeignIdx(idx, trueValIfPresent(o.hasOwnPropertyIdx(idx)), val, receiver, throw)
 }
 
 func (o *objectGoSlice) setForeignStr(name unistring.String, val, receiver Value, throw bool) (bool, bool) {
+	if o.readOnly != nil {
+		o.readOnly.rejectReadOnlyWrite(throw, "assign to property "+name)
+		return false, true
+	}
 	return o._setForeignStr(name, trueValIfPresent(o.hasOwnPropertyStr(name)), val, receiver, throw)
 }
 
@@ -211,6 +240,12 @@ func (o *objectGoSlice) hasOwnPropertyStr(name unistring.String) bool {
 }
 
 func (o *objectGoSlice) defineOwnPropertyIdx(idx valueInt, descr PropertyDescriptor, throw bool) bool {
+	if o.readOnly != nil {
+		if checkFrozenCompatibleDescriptor(o.getOwnPropIdx(idx), descr) {
+			return true
+		}
+		return o.readOnly.rejectReadOnlyWrite(throw, "define property "+idx.string())
+	}
 	if i := toIntStrict(int64(idx)); i >= 0 {
 		if !o.val.runtime.checkHostObjectPropertyDescr(idx.string(), descr, throw) {
 			return false
@@ -228,6 +263,12 @@ func (o *objectGoSlice) defineOwnPropertyIdx(idx valueInt, descr PropertyDescrip
 
 func (o *objectGoSlice) defineOwnPropertyStr(name unistring.String, descr PropertyDescriptor, throw bool) bool {
 	if idx := strToGoIdx(name); idx >= 0 {
+		if o.readOnly != nil {
+			if checkFrozenCompatibleDescriptor(o.getOwnPropStr(name), descr) {
+				return true
+			}
+			return o.readOnly.rejectReadOnlyWrite(throw, "define property "+name)
+		}
 		if !o.val.runtime.checkHostObjectPropertyDescr(name, descr, throw) {
 			return false
 		}
@@ -253,6 +294,9 @@ func (o *objectGoSlice) _deleteIdx(idx int64) {
 
 func (o *objectGoSlice) deleteStr(name unistring.String, throw bool) bool {
 	if idx := strToIdx64(name); idx >= 0 {
+		if o.readOnly != nil {
+			return o.readOnly.rejectReadOnlyWrite(throw, "delete property "+name)
+		}
 		o._deleteIdx(idx)
 		return true
 	}
@@ -262,9 +306,54 @@ func (o *objectGoSlice) deleteStr(name unistring.String, throw bool) bool {
 func (o *objectGoSlice) deleteIdx(i valueInt, throw bool) bool {
 	idx := int64(i)
 	if idx >= 0 {
+		if o.readOnly != nil {
+			return o.readOnly.rejectReadOnlyWrite(throw, "delete property "+i.string())
+		}
 		o._deleteIdx(idx)
 	}
 	return true
+}
+
+func (o *objectGoSlice) setOwnSym(s *Symbol, val Value, throw bool) bool {
+	if o.readOnly != nil {
+		return o.readOnly.rejectReadOnlyWrite(throw, "assign to symbol property")
+	}
+	return o.baseObject.setOwnSym(s, val, throw)
+}
+
+func (o *objectGoSlice) defineOwnPropertySym(s *Symbol, descr PropertyDescriptor, throw bool) bool {
+	if o.readOnly != nil {
+		if checkFrozenCompatibleDescriptor(o.getOwnPropSym(s), descr) {
+			return true
+		}
+		return o.readOnly.rejectReadOnlyWrite(throw, "define symbol property")
+	}
+	return o.baseObject.defineOwnPropertySym(s, descr, throw)
+}
+
+func (o *objectGoSlice) deleteSym(s *Symbol, throw bool) bool {
+	if o.readOnly != nil {
+		return o.readOnly.rejectReadOnlyWrite(throw, "delete symbol property")
+	}
+	return o.baseObject.deleteSym(s, throw)
+}
+
+func (o *objectGoSlice) setProto(proto *Object, throw bool) bool {
+	if o.readOnly != nil {
+		return o.readOnly.rejectReadOnlyWrite(throw, "set prototype")
+	}
+	return o.baseObject.setProto(proto, throw)
+}
+
+func (o *objectGoSlice) isExtensible() bool {
+	return o.readOnly == nil && o.baseObject.isExtensible()
+}
+
+func (o *objectGoSlice) preventExtensions(throw bool) bool {
+	if o.readOnly != nil {
+		return true
+	}
+	return o.baseObject.preventExtensions(throw)
 }
 
 type goslicePropIter struct {
@@ -339,5 +428,8 @@ func (o *objectGoSlice) sortGet(i int) Value {
 }
 
 func (o *objectGoSlice) swap(i int, j int) {
+	if o.readOnly != nil {
+		panic(o.val.runtime.NewTypeError("Cannot sort a read-only host array"))
+	}
 	(*o.data)[i], (*o.data)[j] = (*o.data)[j], (*o.data)[i]
 }

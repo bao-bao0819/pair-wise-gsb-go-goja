@@ -396,6 +396,9 @@ func (r *Runtime) arrayproto_sort(call FunctionCall) Value {
 	}
 
 	if s != nil {
+		if ro, ok := s.(readOnlySortable); ok && ro.readOnlyLength() >= 2 {
+			panic(r.NewTypeError("Cannot sort a read-only host array"))
+		}
 		ctx := arraySortCtx{
 			obj:     s,
 			compare: compareFn,

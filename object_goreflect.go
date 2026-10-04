@@ -109,12 +109,15 @@ type objectGoReflect struct {
 	methodsInfo *reflectMethodsInfo
 
 	methodsValue reflect.Value
+	methodsType  reflect.Type
 
 	valueCache map[string]reflectValueWrapper
 
 	toString, valueOf func() Value
 
 	toJson func() interface{}
+
+	readOnly *readOnlyContext
 }
 
 func (o *objectGoReflect) init() {
@@ -158,6 +161,7 @@ func (o *objectGoReflect) init() {
 	} else {
 		methodsType = o.fieldsValue.Type()
 	}
+	o.methodsType = methodsType
 
 	o.methodsInfo = o.val.runtime.methodsInfo(methodsType)
 
@@ -224,7 +228,7 @@ func (o *objectGoReflect) elemToValue(ev reflect.Value) (Value, reflectValueWrap
 		if ev.CanAddr() {
 			ev = ev.Addr()
 		}
-		ret := o.val.runtime.toValue(ev.Interface(), ev)
+		ret := o.toChildValue(ev.Interface(), ev)
 		if obj, ok := ret.(*Object); ok {
 			if w, ok := obj.self.(reflectValueWrapper); ok {
 				return ret, w
@@ -241,7 +245,17 @@ func (o *objectGoReflect) elemToValue(ev reflect.Value) (Value, reflectValueWrap
 		return _null, nil
 	}
 
-	return o.val.runtime.toValue(ev.Interface(), ev), nil
+	return o.toChildValue(ev.Interface(), ev), nil
+}
+
+// toChildValue converts a nested value. Read-only wrappers propagate their
+// read-only context so nested objects are read-only too and share identity;
+// ordinary wrappers use the regular ToValue mapping.
+func (o *objectGoReflect) toChildValue(i interface{}, rv reflect.Value) Value {
+	if o.readOnly != nil {
+		return o.readOnly.child(i, rv)
+	}
+	return o.val.runtime.toValue(i, rv)
 }
 
 func (o *objectGoReflect) _getFieldValue(name string) Value {
@@ -268,11 +282,21 @@ func (o *objectGoReflect) _get(name string) Value {
 		}
 	}
 
-	if v := o._getMethod(name); v.IsValid() {
-		return o.val.runtime.toValue(v.Interface(), v)
+	if m := o._getMethod(name); m.IsValid() && o.methodEnabled(name) {
+		return o.val.runtime.toValue(m.Interface(), m)
 	}
 
 	return nil
+}
+
+// methodEnabled reports whether the method with the given JS-exposed name is
+// available. Methods are always available on ordinary wrappers; on read-only
+// wrappers they must be explicitly whitelisted.
+func (o *objectGoReflect) methodEnabled(jsName string) bool {
+	if o.readOnly == nil {
+		return true
+	}
+	return o.readOnly.methodAllowed(o.methodsType, jsName)
 }
 
 func (o *objectGoReflect) getOwnPropStr(name unistring.String) Value {
@@ -281,13 +305,16 @@ func (o *objectGoReflect) getOwnPropStr(name unistring.String) Value {
 		if v := o._getFieldValue(n); v != nil {
 			return &valueProperty{
 				value:      v,
-				writable:   true,
+				writable:   o.readOnly == nil,
 				enumerable: true,
 			}
 		}
 	}
 
 	if v := o._getMethod(n); v.IsValid() {
+		if !o.methodEnabled(n) {
+			return o.baseObject.getOwnPropStr(name)
+		}
 		return &valueProperty{
 			value:      o.val.runtime.toValue(v.Interface(), v),
 			enumerable: true,
@@ -298,6 +325,9 @@ func (o *objectGoReflect) getOwnPropStr(name unistring.String) Value {
 }
 
 func (o *objectGoReflect) setOwnStr(name unistring.String, val Value, throw bool) bool {
+	if o.readOnly != nil {
+		return o.readOnly.rejectReadOnlyWrite(throw, "assign to property "+name)
+	}
 	has, ok := o._put(name.String(), val, throw)
 	if !has {
 		if res, ok := o._setForeignStr(name, nil, val, o.val, throw); !ok {
@@ -310,12 +340,42 @@ func (o *objectGoReflect) setOwnStr(name unistring.String, val Value, throw bool
 	return ok
 }
 
+func (o *objectGoReflect) setOwnIdx(idx valueInt, val Value, throw bool) bool {
+	if o.readOnly != nil {
+		return o.readOnly.rejectReadOnlyWrite(throw, "assign to property "+idx.string())
+	}
+	return o.baseObject.setOwnIdx(idx, val, throw)
+}
+
+func (o *objectGoReflect) setOwnSym(s *Symbol, val Value, throw bool) bool {
+	if o.readOnly != nil {
+		return o.readOnly.rejectReadOnlyWrite(throw, "assign to symbol property")
+	}
+	return o.baseObject.setOwnSym(s, val, throw)
+}
+
 func (o *objectGoReflect) setForeignStr(name unistring.String, val, receiver Value, throw bool) (bool, bool) {
+	if o.readOnly != nil {
+		o.readOnly.rejectReadOnlyWrite(throw, "assign to property "+name)
+		return false, true
+	}
 	return o._setForeignStr(name, trueValIfPresent(o._has(name.String())), val, receiver, throw)
 }
 
 func (o *objectGoReflect) setForeignIdx(idx valueInt, val, receiver Value, throw bool) (bool, bool) {
+	if o.readOnly != nil {
+		o.readOnly.rejectReadOnlyWrite(throw, "assign to property "+idx.string())
+		return false, true
+	}
 	return o._setForeignIdx(idx, nil, val, receiver, throw)
+}
+
+func (o *objectGoReflect) setForeignSym(s *Symbol, val, receiver Value, throw bool) (bool, bool) {
+	if o.readOnly != nil {
+		o.readOnly.rejectReadOnlyWrite(throw, "assign to symbol property")
+		return false, true
+	}
+	return o.baseObject.setForeignSym(s, val, receiver, throw)
 }
 
 func (o *objectGoReflect) _put(name string, val Value, throw bool) (has, ok bool) {
@@ -367,6 +427,12 @@ func (r *Runtime) checkHostObjectPropertyDescr(name unistring.String, descr Prop
 }
 
 func (o *objectGoReflect) defineOwnPropertyStr(name unistring.String, descr PropertyDescriptor, throw bool) bool {
+	if o.readOnly != nil {
+		if checkFrozenCompatibleDescriptor(o.getOwnPropStr(name), descr) {
+			return true
+		}
+		return o.readOnly.rejectReadOnlyWrite(throw, "define property "+name)
+	}
 	if o.val.runtime.checkHostObjectPropertyDescr(name, descr, throw) {
 		n := name.String()
 		if has, ok := o._put(n, descr.Value, throw); !has {
@@ -379,13 +445,33 @@ func (o *objectGoReflect) defineOwnPropertyStr(name unistring.String, descr Prop
 	return false
 }
 
+func (o *objectGoReflect) defineOwnPropertyIdx(idx valueInt, descr PropertyDescriptor, throw bool) bool {
+	if o.readOnly != nil {
+		if checkFrozenCompatibleDescriptor(o.getOwnPropIdx(idx), descr) {
+			return true
+		}
+		return o.readOnly.rejectReadOnlyWrite(throw, "define property "+idx.string())
+	}
+	return o.baseObject.defineOwnPropertyIdx(idx, descr, throw)
+}
+
+func (o *objectGoReflect) defineOwnPropertySym(s *Symbol, descr PropertyDescriptor, throw bool) bool {
+	if o.readOnly != nil {
+		if checkFrozenCompatibleDescriptor(o.getOwnPropSym(s), descr) {
+			return true
+		}
+		return o.readOnly.rejectReadOnlyWrite(throw, "define symbol property")
+	}
+	return o.baseObject.defineOwnPropertySym(s, descr, throw)
+}
+
 func (o *objectGoReflect) _has(name string) bool {
 	if o.fieldsValue.Kind() == reflect.Struct {
 		if v := o._getField(name); v.IsValid() {
 			return true
 		}
 	}
-	if v := o._getMethod(name); v.IsValid() {
+	if v := o._getMethod(name); v.IsValid() && o.methodEnabled(name) {
 		return true
 	}
 	return false
@@ -436,12 +522,57 @@ func (o *objectGoReflect) _toStringError() Value {
 }
 
 func (o *objectGoReflect) deleteStr(name unistring.String, throw bool) bool {
+	if o.readOnly != nil {
+		return o.readOnly.rejectReadOnlyWrite(throw, "delete property "+name)
+	}
 	n := name.String()
 	if o._has(n) {
 		o.val.runtime.typeErrorResult(throw, "Cannot delete property %s from a Go type", n)
 		return false
 	}
 	return o.baseObject.deleteStr(name, throw)
+}
+
+func (o *objectGoReflect) deleteIdx(idx valueInt, throw bool) bool {
+	if o.readOnly != nil {
+		return o.readOnly.rejectReadOnlyWrite(throw, "delete property "+idx.string())
+	}
+	return o.baseObject.deleteIdx(idx, throw)
+}
+
+func (o *objectGoReflect) deleteSym(s *Symbol, throw bool) bool {
+	if o.readOnly != nil {
+		return o.readOnly.rejectReadOnlyWrite(throw, "delete symbol property")
+	}
+	return o.baseObject.deleteSym(s, throw)
+}
+
+func (o *objectGoReflect) setProto(proto *Object, throw bool) bool {
+	if o.readOnly != nil {
+		return o.readOnly.rejectReadOnlyWrite(throw, "set prototype")
+	}
+	return o.baseObject.setProto(proto, throw)
+}
+
+func (o *objectGoReflect) isExtensible() bool {
+	if o.readOnly != nil {
+		return false
+	}
+	return o.baseObject.isExtensible()
+}
+
+func (o *objectGoReflect) preventExtensions(throw bool) bool {
+	if o.readOnly != nil {
+		return true
+	}
+	return o.baseObject.preventExtensions(throw)
+}
+
+// enableReadOnly makes the wrapper non-extensible and records the read-only
+// context so nested access and method filtering follow read-only semantics.
+func (o *objectGoReflect) enableReadOnly(ctx *readOnlyContext) {
+	o.readOnly = ctx
+	o.extensible = false
 }
 
 type goreflectPropIter struct {
@@ -462,7 +593,7 @@ func (i *goreflectPropIter) nextField() (propIterItem, iterNextFunc) {
 }
 
 func (i *goreflectPropIter) nextMethod() (propIterItem, iterNextFunc) {
-	names := i.o.methodsInfo.Names
+	names := i.o.enabledMethodNames()
 	if i.idx < len(names) {
 		name := names[i.idx]
 		i.idx++
@@ -470,6 +601,22 @@ func (i *goreflectPropIter) nextMethod() (propIterItem, iterNextFunc) {
 	}
 
 	return propIterItem{}, nil
+}
+
+func (o *objectGoReflect) enabledMethodNames() []string {
+	if o.methodsInfo == nil || len(o.methodsInfo.Names) == 0 {
+		return nil
+	}
+	if o.readOnly == nil {
+		return o.methodsInfo.Names
+	}
+	names := make([]string, 0, len(o.methodsInfo.Names))
+	for _, name := range o.methodsInfo.Names {
+		if o.methodEnabled(name) {
+			names = append(names, name)
+		}
+	}
+	return names
 }
 
 func (o *objectGoReflect) iterateStringKeys() iterNextFunc {
@@ -491,7 +638,7 @@ func (o *objectGoReflect) stringKeys(_ bool, accum []Value) []Value {
 		}
 	}
 
-	for _, name := range o.methodsInfo.Names {
+	for _, name := range o.enabledMethodNames() {
 		accum = append(accum, newStringValue(name))
 	}
 

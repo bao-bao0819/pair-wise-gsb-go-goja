@@ -4,6 +4,7 @@ import (
 	"math"
 	"math/bits"
 	"reflect"
+	"strconv"
 
 	"github.com/dop251/goja/unistring"
 )
@@ -16,6 +17,16 @@ func (o *objectGoSliceReflect) init() {
 	o.objectGoArrayReflect._init()
 	o.lengthProp.writable = true
 	o.putIdx = o._putIdx
+}
+
+func (o *objectGoSliceReflect) enableReadOnly(ctx *readOnlyContext) {
+	o.objectGoReflect.enableReadOnly(ctx)
+	o.updateLen()
+	o.lengthProp.writable = false
+	o.lengthProp.configurable = false
+	o.putIdx = func(idx int, v Value, throw bool) bool {
+		return ctx.rejectReadOnlyWrite(throw, unistring.String("assign to property "+strconv.Itoa(idx)))
+	}
 }
 
 func (o *objectGoSliceReflect) _putIdx(idx int, v Value, throw bool) bool {
@@ -61,6 +72,9 @@ func (o *objectGoSliceReflect) shrink(size int) {
 }
 
 func (o *objectGoSliceReflect) putLength(v uint32, throw bool) bool {
+	if o.readOnly != nil {
+		return o.readOnly.rejectReadOnlyWrite(throw, "set length")
+	}
 	if bits.UintSize == 32 && v > math.MaxInt32 {
 		panic(rangeError("Integer value overflows 32-bit int"))
 	}
@@ -76,6 +90,9 @@ func (o *objectGoSliceReflect) putLength(v uint32, throw bool) bool {
 
 func (o *objectGoSliceReflect) setOwnStr(name unistring.String, val Value, throw bool) bool {
 	if name == "length" {
+		if o.readOnly != nil {
+			return o.readOnly.rejectReadOnlyWrite(throw, "set length")
+		}
 		return o.putLength(o.val.runtime.toLengthUint32(val), throw)
 	}
 	return o.objectGoArrayReflect.setOwnStr(name, val, throw)

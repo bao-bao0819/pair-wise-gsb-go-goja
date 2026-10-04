@@ -45,7 +45,7 @@ func (o *objectGoMapReflect) _getKey(key reflect.Value) Value {
 		if rv.Kind() == reflect.Interface {
 			rv = rv.Elem()
 		}
-		return o.val.runtime.toValue(v.Interface(), rv)
+		return o.toChildValue(v.Interface(), rv)
 	}
 
 	return nil
@@ -77,7 +77,7 @@ func (o *objectGoMapReflect) getOwnPropStr(name unistring.String) Value {
 	if v := o._getStr(name.String()); v != nil {
 		return &valueProperty{
 			value:      v,
-			writable:   true,
+			writable:   o.readOnly == nil,
 			enumerable: true,
 		}
 	}
@@ -88,7 +88,7 @@ func (o *objectGoMapReflect) getOwnPropIdx(idx valueInt) Value {
 	if v := o._get(idx); v != nil {
 		return &valueProperty{
 			value:      v,
-			writable:   true,
+			writable:   o.readOnly == nil,
 			enumerable: true,
 		}
 	}
@@ -124,6 +124,9 @@ func (o *objectGoMapReflect) _put(key reflect.Value, val Value, throw bool) bool
 }
 
 func (o *objectGoMapReflect) setOwnStr(name unistring.String, val Value, throw bool) bool {
+	if o.readOnly != nil {
+		return o.readOnly.rejectReadOnlyWrite(throw, "assign to property "+name)
+	}
 	n := name.String()
 	key := o.strToKey(n, false)
 	if !key.IsValid() || !o.fieldsValue.MapIndex(key).IsValid() {
@@ -149,6 +152,9 @@ func (o *objectGoMapReflect) setOwnStr(name unistring.String, val Value, throw b
 }
 
 func (o *objectGoMapReflect) setOwnIdx(idx valueInt, val Value, throw bool) bool {
+	if o.readOnly != nil {
+		return o.readOnly.rejectReadOnlyWrite(throw, "assign to property "+idx.string())
+	}
 	key := o.toKey(idx, false)
 	if !key.IsValid() || !o.fieldsValue.MapIndex(key).IsValid() {
 		if proto := o.prototype; proto != nil {
@@ -173,14 +179,28 @@ func (o *objectGoMapReflect) setOwnIdx(idx valueInt, val Value, throw bool) bool
 }
 
 func (o *objectGoMapReflect) setForeignStr(name unistring.String, val, receiver Value, throw bool) (bool, bool) {
+	if o.readOnly != nil {
+		o.readOnly.rejectReadOnlyWrite(throw, "assign to property "+name)
+		return false, true
+	}
 	return o._setForeignStr(name, trueValIfPresent(o.hasOwnPropertyStr(name)), val, receiver, throw)
 }
 
 func (o *objectGoMapReflect) setForeignIdx(idx valueInt, val, receiver Value, throw bool) (bool, bool) {
+	if o.readOnly != nil {
+		o.readOnly.rejectReadOnlyWrite(throw, "assign to property "+idx.string())
+		return false, true
+	}
 	return o._setForeignIdx(idx, trueValIfPresent(o.hasOwnPropertyIdx(idx)), val, receiver, throw)
 }
 
 func (o *objectGoMapReflect) defineOwnPropertyStr(name unistring.String, descr PropertyDescriptor, throw bool) bool {
+	if o.readOnly != nil {
+		if checkFrozenCompatibleDescriptor(o.getOwnPropStr(name), descr) {
+			return true
+		}
+		return o.readOnly.rejectReadOnlyWrite(throw, "define property "+name)
+	}
 	if !o.val.runtime.checkHostObjectPropertyDescr(name, descr, throw) {
 		return false
 	}
@@ -189,6 +209,12 @@ func (o *objectGoMapReflect) defineOwnPropertyStr(name unistring.String, descr P
 }
 
 func (o *objectGoMapReflect) defineOwnPropertyIdx(idx valueInt, descr PropertyDescriptor, throw bool) bool {
+	if o.readOnly != nil {
+		if checkFrozenCompatibleDescriptor(o.getOwnPropIdx(idx), descr) {
+			return true
+		}
+		return o.readOnly.rejectReadOnlyWrite(throw, "define property "+idx.string())
+	}
 	if !o.val.runtime.checkHostObjectPropertyDescr(idx.string(), descr, throw) {
 		return false
 	}
@@ -213,6 +239,9 @@ func (o *objectGoMapReflect) hasOwnPropertyIdx(idx valueInt) bool {
 }
 
 func (o *objectGoMapReflect) deleteStr(name unistring.String, throw bool) bool {
+	if o.readOnly != nil {
+		return o.readOnly.rejectReadOnlyWrite(throw, "delete property "+name)
+	}
 	key := o.strToKey(name.String(), throw)
 	if !key.IsValid() {
 		return false
@@ -222,12 +251,39 @@ func (o *objectGoMapReflect) deleteStr(name unistring.String, throw bool) bool {
 }
 
 func (o *objectGoMapReflect) deleteIdx(idx valueInt, throw bool) bool {
+	if o.readOnly != nil {
+		return o.readOnly.rejectReadOnlyWrite(throw, "delete property "+idx.string())
+	}
 	key := o.toKey(idx, throw)
 	if !key.IsValid() {
 		return false
 	}
 	o.fieldsValue.SetMapIndex(key, reflect.Value{})
 	return true
+}
+
+func (o *objectGoMapReflect) deleteSym(s *Symbol, throw bool) bool {
+	if o.readOnly != nil {
+		return o.readOnly.rejectReadOnlyWrite(throw, "delete symbol property")
+	}
+	return o.baseObject.deleteSym(s, throw)
+}
+
+func (o *objectGoMapReflect) setOwnSym(s *Symbol, val Value, throw bool) bool {
+	if o.readOnly != nil {
+		return o.readOnly.rejectReadOnlyWrite(throw, "assign to symbol property")
+	}
+	return o.baseObject.setOwnSym(s, val, throw)
+}
+
+func (o *objectGoMapReflect) defineOwnPropertySym(s *Symbol, descr PropertyDescriptor, throw bool) bool {
+	if o.readOnly != nil {
+		if checkFrozenCompatibleDescriptor(o.getOwnPropSym(s), descr) {
+			return true
+		}
+		return o.readOnly.rejectReadOnlyWrite(throw, "define symbol property")
+	}
+	return o.baseObject.defineOwnPropertySym(s, descr, throw)
 }
 
 type gomapReflectPropIter struct {

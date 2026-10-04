@@ -69,6 +69,15 @@ func (o *objectGoArrayReflect) init() {
 	o.putIdx = o._putIdx
 }
 
+func (o *objectGoArrayReflect) enableReadOnly(ctx *readOnlyContext) {
+	o.objectGoReflect.enableReadOnly(ctx)
+	o.lengthProp.writable = false
+	o.lengthProp.configurable = false
+	o.putIdx = func(idx int, v Value, throw bool) bool {
+		return ctx.rejectReadOnlyWrite(throw, unistring.String("assign to property "+strconv.Itoa(idx)))
+	}
+}
+
 func (o *objectGoArrayReflect) updateLen() {
 	o.lengthProp.value = intToValue(int64(o.fieldsValue.Len()))
 }
@@ -129,7 +138,7 @@ func (o *objectGoArrayReflect) getOwnPropStr(name unistring.String) Value {
 		if idx < o.fieldsValue.Len() {
 			return &valueProperty{
 				value:      o._getIdx(idx),
-				writable:   true,
+				writable:   o.readOnly == nil,
 				enumerable: true,
 			}
 		}
@@ -148,7 +157,7 @@ func (o *objectGoArrayReflect) getOwnPropIdx(idx valueInt) Value {
 	if idx := toIntStrict(int64(idx)); idx >= 0 && idx < o.fieldsValue.Len() {
 		return &valueProperty{
 			value:      o._getIdx(idx),
-			writable:   true,
+			writable:   o.readOnly == nil,
 			enumerable: true,
 		}
 	}
@@ -233,6 +242,12 @@ func (o *objectGoArrayReflect) hasOwnPropertyStr(name unistring.String) bool {
 }
 
 func (o *objectGoArrayReflect) defineOwnPropertyIdx(idx valueInt, descr PropertyDescriptor, throw bool) bool {
+	if o.readOnly != nil {
+		if checkFrozenCompatibleDescriptor(o.getOwnPropIdx(idx), descr) {
+			return true
+		}
+		return o.readOnly.rejectReadOnlyWrite(throw, "define property "+idx.string())
+	}
 	if i := toIntStrict(int64(idx)); i >= 0 {
 		if !o.val.runtime.checkHostObjectPropertyDescr(idx.string(), descr, throw) {
 			return false
@@ -248,6 +263,12 @@ func (o *objectGoArrayReflect) defineOwnPropertyIdx(idx valueInt, descr Property
 }
 
 func (o *objectGoArrayReflect) defineOwnPropertyStr(name unistring.String, descr PropertyDescriptor, throw bool) bool {
+	if o.readOnly != nil {
+		if checkFrozenCompatibleDescriptor(o.getOwnPropStr(name), descr) {
+			return true
+		}
+		return o.readOnly.rejectReadOnlyWrite(throw, "define property "+name)
+	}
 	if idx := strToGoIdx(name); idx >= 0 {
 		if !o.val.runtime.checkHostObjectPropertyDescr(name, descr, throw) {
 			return false
@@ -260,6 +281,16 @@ func (o *objectGoArrayReflect) defineOwnPropertyStr(name unistring.String, descr
 	}
 	o.val.runtime.typeErrorResult(throw, "Cannot define property '%s' on a Go slice", name)
 	return false
+}
+
+func (o *objectGoArrayReflect) defineOwnPropertySym(s *Symbol, descr PropertyDescriptor, throw bool) bool {
+	if o.readOnly != nil {
+		if checkFrozenCompatibleDescriptor(o.getOwnPropSym(s), descr) {
+			return true
+		}
+		return o.readOnly.rejectReadOnlyWrite(throw, "define symbol property")
+	}
+	return o.baseObject.defineOwnPropertySym(s, descr, throw)
 }
 
 func (o *objectGoArrayReflect) _deleteIdx(idx int) {
@@ -275,6 +306,9 @@ func (o *objectGoArrayReflect) _deleteIdx(idx int) {
 
 func (o *objectGoArrayReflect) deleteStr(name unistring.String, throw bool) bool {
 	if idx := strToGoIdx(name); idx >= 0 {
+		if o.readOnly != nil {
+			return o.readOnly.rejectReadOnlyWrite(throw, "delete property "+name)
+		}
 		o._deleteIdx(idx)
 		return true
 	}
@@ -285,9 +319,19 @@ func (o *objectGoArrayReflect) deleteStr(name unistring.String, throw bool) bool
 func (o *objectGoArrayReflect) deleteIdx(i valueInt, throw bool) bool {
 	idx := toIntStrict(int64(i))
 	if idx >= 0 {
+		if o.readOnly != nil {
+			return o.readOnly.rejectReadOnlyWrite(throw, "delete property "+i.string())
+		}
 		o._deleteIdx(idx)
 	}
 	return true
+}
+
+func (o *objectGoArrayReflect) deleteSym(s *Symbol, throw bool) bool {
+	if o.readOnly != nil {
+		return o.readOnly.rejectReadOnlyWrite(throw, "delete symbol property")
+	}
+	return o.baseObject.deleteSym(s, throw)
 }
 
 type goArrayReflectPropIter struct {
@@ -329,6 +373,13 @@ func (o *objectGoArrayReflect) sortGet(i int) Value {
 }
 
 func (o *objectGoArrayReflect) swap(i int, j int) {
+	if o.readOnly != nil {
+		// sort() of a non-empty frozen array must report a TypeError without
+		// touching the underlying Go slice. Array.prototype.sort checks the
+		// length before swapping, so reaching here with >= 2 elements means
+		// throwing is the spec-compliant outcome.
+		panic(o.val.runtime.NewTypeError("Cannot sort a read-only host array"))
+	}
 	vi := o.fieldsValue.Index(i)
 	vj := o.fieldsValue.Index(j)
 	tmp := reflect.New(o.fieldsValue.Type().Elem()).Elem()

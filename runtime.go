@@ -1808,6 +1808,47 @@ func (r *Runtime) ToValue(i interface{}) Value {
 	return r.toValue(i, reflect.Value{})
 }
 
+// ToReadOnlyValue converts i to a read-only Value the same way ToValue does,
+// with one difference: struct, map, slice and array values (and any nested
+// combinations of them) are exposed as non-extensible host objects whose
+// properties are non-writable and non-configurable.
+//
+// This is intended for passing configuration data to scripts without first
+// serialising it to JSON. Reads preserve the usual Go-to-JavaScript mapping:
+// there is no data copy, Export() on a returned object yields the original Go
+// value, and distinct paths that lead to the same Go object resolve to the
+// same wrapper (so '===' is stable, just like ToValue).
+//
+// Every mutation follows standard ECMAScript rules for a frozen object:
+// assignment, 'delete', Object.defineProperty and __proto__ changes fail with
+// a TypeError in strict mode and are silently ignored in sloppy mode. Mutating
+// array methods (push, pop, splice, sort, reverse, fill, copyWithin, length
+// assignment, ...) fail the same way. A failed operation never changes the
+// underlying Go value.
+//
+// Go methods are hidden by default, because they receive the real receiver and
+// may mutate it. Methods can be exposed explicitly with ReadOnlyMethods or
+// ReadOnlyMethodsByType options. Whitelisting a method does not make it pure.
+//
+// ToValue itself is unchanged: values converted with ToValue remain writable.
+func (r *Runtime) ToReadOnlyValue(i interface{}, opts ...ReadOnlyOption) Value {
+	options := readOnlyOptions{}
+	for _, opt := range opts {
+		opt(&options)
+	}
+	ctx := &readOnlyContext{
+		runtime:  r,
+		methods:  options.methods,
+		wrappers: make(map[readOnlyObjectKey]*Object),
+	}
+	return r.toReadOnlyValue(i, reflect.Value{}, ctx)
+}
+
+func (r *Runtime) toReadOnlyValue(i interface{}, origValue reflect.Value, ctx *readOnlyContext) Value {
+	v := r.toValue(i, origValue)
+	return r.markReadOnly(v, ctx)
+}
+
 func (r *Runtime) toValue(i interface{}, origValue reflect.Value) Value {
 	switch i := i.(type) {
 	case nil:

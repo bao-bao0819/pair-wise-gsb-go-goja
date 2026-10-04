@@ -8,7 +8,8 @@ import (
 
 type objectGoMapSimple struct {
 	baseObject
-	data map[string]interface{}
+	data     map[string]interface{}
+	readOnly *readOnlyContext
 }
 
 func (o *objectGoMapSimple) init() {
@@ -23,6 +24,9 @@ func (o *objectGoMapSimple) _getStr(name string) Value {
 	if !exists {
 		return nil
 	}
+	if o.readOnly != nil {
+		return o.readOnly.child(v, reflect.Value{})
+	}
 	return o.val.runtime.ToValue(v)
 }
 
@@ -35,12 +39,19 @@ func (o *objectGoMapSimple) getStr(name unistring.String, receiver Value) Value 
 
 func (o *objectGoMapSimple) getOwnPropStr(name unistring.String) Value {
 	if v := o._getStr(name.String()); v != nil {
-		return v
+		return &valueProperty{
+			value:      v,
+			writable:   o.readOnly == nil,
+			enumerable: true,
+		}
 	}
 	return nil
 }
 
 func (o *objectGoMapSimple) setOwnStr(name unistring.String, val Value, throw bool) bool {
+	if o.readOnly != nil {
+		return o.readOnly.rejectReadOnlyWrite(throw, "assign to property "+name)
+	}
 	n := name.String()
 	if _, exists := o.data[n]; exists {
 		o.data[n] = val.Export()
@@ -70,6 +81,10 @@ func trueValIfPresent(present bool) Value {
 }
 
 func (o *objectGoMapSimple) setForeignStr(name unistring.String, val, receiver Value, throw bool) (bool, bool) {
+	if o.readOnly != nil {
+		o.readOnly.rejectReadOnlyWrite(throw, "assign to property "+name)
+		return false, true
+	}
 	return o._setForeignStr(name, trueValIfPresent(o._hasStr(name.String())), val, receiver, throw)
 }
 
@@ -83,6 +98,12 @@ func (o *objectGoMapSimple) hasOwnPropertyStr(name unistring.String) bool {
 }
 
 func (o *objectGoMapSimple) defineOwnPropertyStr(name unistring.String, descr PropertyDescriptor, throw bool) bool {
+	if o.readOnly != nil {
+		if checkFrozenCompatibleDescriptor(o.getOwnPropStr(name), descr) {
+			return true
+		}
+		return o.readOnly.rejectReadOnlyWrite(throw, "define property "+name)
+	}
 	if !o.val.runtime.checkHostObjectPropertyDescr(name, descr, throw) {
 		return false
 	}
@@ -97,9 +118,86 @@ func (o *objectGoMapSimple) defineOwnPropertyStr(name unistring.String, descr Pr
 	return false
 }
 
-func (o *objectGoMapSimple) deleteStr(name unistring.String, _ bool) bool {
+func (o *objectGoMapSimple) deleteStr(name unistring.String, throw bool) bool {
+	if o.readOnly != nil {
+		return o.readOnly.rejectReadOnlyWrite(throw, "delete property "+name)
+	}
 	delete(o.data, name.String())
 	return true
+}
+
+func (o *objectGoMapSimple) setOwnIdx(idx valueInt, val Value, throw bool) bool {
+	if o.readOnly != nil {
+		return o.readOnly.rejectReadOnlyWrite(throw, "assign to property "+idx.string())
+	}
+	return o.baseObject.setOwnIdx(idx, val, throw)
+}
+
+func (o *objectGoMapSimple) setOwnSym(s *Symbol, val Value, throw bool) bool {
+	if o.readOnly != nil {
+		return o.readOnly.rejectReadOnlyWrite(throw, "assign to symbol property")
+	}
+	return o.baseObject.setOwnSym(s, val, throw)
+}
+
+func (o *objectGoMapSimple) defineOwnPropertyIdx(idx valueInt, descr PropertyDescriptor, throw bool) bool {
+	if o.readOnly != nil {
+		if checkFrozenCompatibleDescriptor(o.getOwnPropIdx(idx), descr) {
+			return true
+		}
+		return o.readOnly.rejectReadOnlyWrite(throw, "define property "+idx.string())
+	}
+	return o.baseObject.defineOwnPropertyIdx(idx, descr, throw)
+}
+
+func (o *objectGoMapSimple) defineOwnPropertySym(s *Symbol, descr PropertyDescriptor, throw bool) bool {
+	if o.readOnly != nil {
+		if checkFrozenCompatibleDescriptor(o.getOwnPropSym(s), descr) {
+			return true
+		}
+		return o.readOnly.rejectReadOnlyWrite(throw, "define symbol property")
+	}
+	return o.baseObject.defineOwnPropertySym(s, descr, throw)
+}
+
+func (o *objectGoMapSimple) deleteIdx(idx valueInt, throw bool) bool {
+	if o.readOnly != nil {
+		return o.readOnly.rejectReadOnlyWrite(throw, "delete property "+idx.string())
+	}
+	return o.baseObject.deleteIdx(idx, throw)
+}
+
+func (o *objectGoMapSimple) deleteSym(s *Symbol, throw bool) bool {
+	if o.readOnly != nil {
+		return o.readOnly.rejectReadOnlyWrite(throw, "delete symbol property")
+	}
+	return o.baseObject.deleteSym(s, throw)
+}
+
+func (o *objectGoMapSimple) setProto(proto *Object, throw bool) bool {
+	if o.readOnly != nil {
+		return o.readOnly.rejectReadOnlyWrite(throw, "set prototype")
+	}
+	return o.baseObject.setProto(proto, throw)
+}
+
+func (o *objectGoMapSimple) isExtensible() bool {
+	if o.readOnly != nil {
+		return false
+	}
+	return o.baseObject.isExtensible()
+}
+
+func (o *objectGoMapSimple) preventExtensions(throw bool) bool {
+	if o.readOnly != nil {
+		return true
+	}
+	return o.baseObject.preventExtensions(throw)
+}
+
+func (o *objectGoMapSimple) enableReadOnly(ctx *readOnlyContext) {
+	o.readOnly = ctx
+	o.extensible = false
 }
 
 type gomapPropIter struct {

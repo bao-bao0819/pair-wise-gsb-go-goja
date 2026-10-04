@@ -212,6 +212,23 @@ fmt.Println(res.Export())
 There are two standard mappers: [TagFieldNameMapper](https://pkg.go.dev/github.com/dop251/goja#TagFieldNameMapper) and
 [UncapFieldNameMapper](https://pkg.go.dev/github.com/dop251/goja#UncapFieldNameMapper), or you can use your own implementation.
 
+Read-only host values
+---------------------
+
+Configuration data that should be readable by scripts but not serialised to JSON first can be
+exposed using [Runtime.ToReadOnlyValue()](https://pkg.go.dev/github.com/dop251/goja#Runtime.ToReadOnlyValue).
+It produces the same Go-to-JavaScript mapping as `ToValue()` for structs, maps, slices and arrays
+(including nested combinations), except the resulting host objects and every nested object are
+frozen: assignment, `delete`, `Object.defineProperty`, prototype changes and mutating array
+methods fail with a `TypeError` in strict mode and are silently ignored in sloppy mode. A failed
+operation never changes the underlying Go value. Distinct paths to the same Go object resolve to
+the same wrapper.
+
+Go methods are hidden by default, because they run on the real receiver and may mutate it. Methods
+can be exposed explicitly with [ReadOnlyMethods](https://pkg.go.dev/github.com/dop251/goja#ReadOnlyMethods)
+and [ReadOnlyMethodsByType](https://pkg.go.dev/github.com/dop251/goja#ReadOnlyMethodsByType).
+Whitelisting a method does not make it pure.
+
 Native Constructors
 -------------------
 
