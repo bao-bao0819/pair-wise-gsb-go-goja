@@ -29,6 +29,20 @@ type arrayBufferObject struct {
 	baseObject
 	detached bool
 	data     []byte
+	// ownership says who is allowed to alias data. Buffers created by
+	// Runtime.NewArrayBuffer (host-provided storage) are OwnershipExternal:
+	// the host may keep its own []byte alias and transfer only moves the JS
+	// object's reference. Buffers allocated by the engine or through
+	// NewManagedArrayBuffer are OwnershipExclusive: no host alias is
+	// permitted to exist, so transfer genuinely moves the sole owner of the
+	// underlying bytes. Any path that hands data out to Go (Bytes(), Export
+	// to []byte) downgrades the buffer to OwnershipExternal.
+	ownership ArrayBufferOwnership
+	// shared identifies a SharedArrayBuffer-like buffer. The engine itself
+	// never creates one; if a future embedder does, transfers of it are
+	// refused by TransferArrayBuffers because shared memory cannot be
+	// exclusively owned.
+	shared bool
 }
 
 // ArrayBuffer is a Go wrapper around ECMAScript ArrayBuffer. Calling Runtime.ToValue() on it
@@ -36,6 +50,33 @@ type arrayBufferObject struct {
 // Use Runtime.NewArrayBuffer([]byte) to create one.
 type ArrayBuffer struct {
 	buf *arrayBufferObject
+}
+
+// ArrayBufferOwnership describes who may hold an alias to an ArrayBuffer's
+// backing bytes. It controls which buffers can be moved with a strict,
+// single-owner contract in TransferArrayBuffers.
+type ArrayBufferOwnership int
+
+const (
+	// OwnershipExternal means the backing bytes were supplied by the host
+	// through Runtime.NewArrayBuffer or have been exposed to Go (e.g. via
+	// Bytes() or Export into []byte). The host is permitted to retain its own
+	// alias; transferring the buffer detaches the JS views but cannot
+	// invalidate Go slices the caller already holds. This is the default for
+	// any host-wrapped buffer.
+	OwnershipExternal ArrayBufferOwnership = iota
+
+	// OwnershipExclusive means the only reference to the backing storage is
+	// the ArrayBuffer itself. The host promises not to retain or take a
+	// []byte alias. Transferring an exclusive buffer is a genuine ownership
+	// move: after commit the destination Runtime owns the one and only copy of
+	// the bytes and the source is detached.
+	OwnershipExclusive
+)
+
+// Ownership reports the current ownership mode of the buffer.
+func (a ArrayBuffer) Ownership() ArrayBufferOwnership {
+	return a.buf.ownership
 }
 
 type dataViewObject struct {
@@ -91,7 +132,14 @@ func (a ArrayBuffer) toValue(r *Runtime) Value {
 
 // Bytes returns the underlying []byte for this ArrayBuffer.
 // For detached ArrayBuffers returns nil.
+//
+// Because this hands the backing storage to Go, it downgrades the buffer's ownership mode to
+// OwnershipExternal (a Go alias now exists). Such a buffer can no longer be transferred under a
+// RequireExclusiveOwnership contract.
 func (a ArrayBuffer) Bytes() []byte {
+	if a.buf != nil && !a.buf.detached {
+		a.buf.ownership = OwnershipExternal
+	}
 	return a.buf.data
 }
 
@@ -119,12 +167,62 @@ func (a ArrayBuffer) Detached() bool {
 // typed array of a multibyte type (uint16, uint32, etc.) is created from a buffer backed by an unaligned slice,
 // using this typed array will result in unaligned access which may cause performance degradation or runtime panics
 // on some architectures or configurations.
+//
+// Ownership: the provided data slice remains owned by the caller. The buffer is created with
+// OwnershipExternal, meaning the caller may keep using data after creating the buffer and after
+// TransferArrayBuffers: detaching the ECMAScript buffer cannot invalidate Go []byte aliases that
+// already exist. For buffers whose backing storage is exclusively owned by the engine use
+// NewManagedArrayBuffer instead.
 func (r *Runtime) NewArrayBuffer(data []byte) ArrayBuffer {
 	buf := r._newArrayBuffer(r.getArrayBufferPrototype(), nil)
 	buf.data = data
+	buf.ownership = OwnershipExternal
 	return ArrayBuffer{
 		buf: buf,
 	}
+}
+
+// NewManagedArrayBuffer creates an ArrayBuffer that exclusively owns the storage handed over by a
+// ManagedBytes. Unlike NewArrayBuffer there is no host-owned []byte alias: the bytes are allocated
+// (or produced through a fill function) solely for this buffer, and the ManagedBytes is consumed.
+//
+// The returned buffer has OwnershipExclusive. Taking its bytes from Go (ArrayBuffer.Bytes or
+// exporting it into []byte) downgrades it to OwnershipExternal because an alias has escaped; such
+// a buffer can still be transferred but only the JS reference moves. To guarantee that a whole
+// transfer batch consists of exclusively owned storage, pass RequireExclusiveOwnership: true to
+// TransferArrayBuffers.
+//
+// NewManagedArrayBuffer returns ErrManagedBytesConsumed if the ManagedBytes was already taken.
+func (r *Runtime) NewManagedArrayBuffer(b ManagedBytes) (ArrayBuffer, error) {
+	data, err := b.take()
+	if err != nil {
+		return ArrayBuffer{}, err
+	}
+	buf := r._newArrayBuffer(r.getArrayBufferPrototype(), nil)
+	buf.data = data
+	buf.ownership = OwnershipExclusive
+	return ArrayBuffer{buf: buf}, nil
+}
+
+// NewManagedArrayBufferFunc is a convenience wrapper around NewManagedBytesFunc for when the data
+// is produced by a fill callback. It never copies the produced bytes into a second allocation.
+func (r *Runtime) NewManagedArrayBufferFunc(size int, fill func(dst []byte) error) (ArrayBuffer, error) {
+	mb, err := NewManagedBytesFunc(size, fill)
+	if err != nil {
+		return ArrayBuffer{}, err
+	}
+	return r.NewManagedArrayBuffer(mb)
+}
+
+// AllocateManagedArrayBuffer allocates size bytes owned exclusively by the new ArrayBuffer. The
+// backing array is allocated by the engine and no host alias is created.
+func (r *Runtime) AllocateManagedArrayBuffer(size int) ArrayBuffer {
+	buf := r._newArrayBuffer(r.getArrayBufferPrototype(), nil)
+	if size > 0 {
+		buf.data = allocByteSlice(size)
+	}
+	buf.ownership = OwnershipExclusive
+	return ArrayBuffer{buf: buf}
 }
 
 func (a *uint8Array) toRaw(v Value) uint64 {
@@ -961,6 +1059,7 @@ func (a *typedArrayObject) iterateStringKeys() iterNextFunc {
 
 func (a *typedArrayObject) exportToArrayOrSlice(dst reflect.Value, typ reflect.Type, ctx *objectExportCtx) error {
 	if typ == typeBytes {
+		a.viewedArrayBuf.ownership = OwnershipExternal // a host []byte alias is about to escape
 		dst.Set(reflect.ValueOf(a.viewedArrayBuf.data[a.offset*a.elemSize : (a.offset+a.length)*a.elemSize]))
 		return nil
 	}
@@ -968,6 +1067,7 @@ func (a *typedArrayObject) exportToArrayOrSlice(dst reflect.Value, typ reflect.T
 }
 
 func (a *typedArrayObject) export(_ *objectExportCtx) interface{} {
+	a.viewedArrayBuf.ownership = OwnershipExternal // generic export hands the storage to Go
 	return a.typedArray.export(a.offset, a.length)
 }
 
@@ -977,6 +1077,7 @@ func (a *typedArrayObject) exportType() reflect.Type {
 
 func (o *dataViewObject) exportToArrayOrSlice(dst reflect.Value, typ reflect.Type, ctx *objectExportCtx) error {
 	if typ == typeBytes {
+		o.viewedArrayBuf.ownership = OwnershipExternal // a host []byte alias is about to escape
 		dst.Set(reflect.ValueOf(o.viewedArrayBuf.data[o.byteOffset : o.byteOffset+o.byteLen]))
 		return nil
 	}
@@ -1256,6 +1357,7 @@ func (o *arrayBufferObject) export(*objectExportCtx) interface{} {
 
 func (o *arrayBufferObject) exportToArrayOrSlice(dst reflect.Value, typ reflect.Type, ctx *objectExportCtx) error {
 	if typ == typeBytes {
+		o.ownership = OwnershipExternal // a host []byte alias is about to escape
 		dst.Set(reflect.ValueOf(o.data))
 		return nil
 	}
@@ -1273,6 +1375,10 @@ func (r *Runtime) _newArrayBuffer(proto *Object, o *Object) *arrayBufferObject {
 			prototype:  proto,
 			extensible: true,
 		},
+		// Storage created through the engine (ArrayBuffer constructor,
+		// TypedArray constructors, .slice, etc.) is exclusively owned until
+		// the host takes an alias to it.
+		ownership: OwnershipExclusive,
 	}
 	o.self = b
 	b.init()

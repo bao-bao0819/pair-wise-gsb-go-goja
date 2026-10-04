@@ -42,6 +42,22 @@ an integer overflow, the result will be incorrect, for example:
 Date.UTC(1970, 0, 1, 80063993375, 29, 1, -288230376151711740) // returns 29256 instead of 29312
 ```
 
+### Cross-runtime ArrayBuffer transfer
+Large binary payloads can be moved between two isolated Runtimes with the host-callable
+`TransferArrayBuffers(dst, src, buffers, options)` without copying the underlying bytes. Every entry is validated
+(source Runtime, duplicates, detached state, shared memory, ownership mode, busy Runtimes) before any buffer is
+touched, so a failed batch leaves every source buffer usable. On success the sources and all of their TypedArray and
+DataView views show standard ECMAScript detached-buffer behaviour, while the returned destination buffers are backed
+by the exact same allocation (relinked slice headers, not copied bytes).
+
+Ownership has to be considered explicitly: `Runtime.NewArrayBuffer(data)` creates an `OwnershipExternal` buffer, so
+the host keeps its `[]byte` alias and transfer cannot invalidate slices the caller already holds. For a strict
+single-owner contract create the storage through `Runtime.NewManagedArrayBuffer` (or allocate it inside the Runtime)
+and pass `RequireExclusiveOwnership: true`; taking bytes from Go (`ArrayBuffer.Bytes` or exporting into `[]byte`)
+downgrades such a buffer to `OwnershipExternal` because an alias has escaped. Shared-memory buffers and combinations
+where either Runtime is executing JavaScript concurrently are rejected (`ErrSharedArrayBuffer`, `ErrRuntimeBusy`),
+never partially transferred. A plain deep copy of an object graph is not a transfer and does not move ownership.
+
 FAQ
 ---
 

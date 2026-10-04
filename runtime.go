@@ -210,6 +210,12 @@ type Runtime struct {
 	// Stack for tracking objects currently being converted to string
 	// to detect and handle circular references
 	toStringStack []*Object
+
+	// vmGate serializes two things that must never overlap: JavaScript
+	// execution on this Runtime (RunProgram/runWrapped) and cross-runtime
+	// ArrayBuffer transfers (TransferArrayBuffers). See arraybuffer_transfer.go
+	// for the contract.
+	vmGate vmActivityGate
 }
 
 type StackFrame struct {
@@ -1444,6 +1450,12 @@ func asUncatchableException(v interface{}) error {
 func (r *Runtime) RunProgram(p *Program) (result Value, err error) {
 	vm := r.vm
 	recursive := len(vm.callStack) > 0
+	if !recursive {
+		if !r.vmGate.enter() {
+			return nil, ErrRuntimeBusy
+		}
+		defer r.vmGate.exit()
+	}
 	defer func() {
 		if recursive {
 			vm.sp -= 2
@@ -2525,11 +2537,18 @@ func AssertConstructor(v Value) (Constructor, bool) {
 }
 
 func (r *Runtime) runWrapped(f func()) (err error) {
+	topLevel := len(r.vm.callStack) == 0
+	if topLevel {
+		if !r.vmGate.enter() {
+			return ErrRuntimeBusy
+		}
+		defer r.vmGate.exit()
+	}
 	defer func() {
 		if x := recover(); x != nil {
 			if ex := asUncatchableException(x); ex != nil {
 				err = ex
-				if len(r.vm.callStack) == 0 {
+				if topLevel {
 					r.leaveAbrupt()
 				}
 			} else {
@@ -2541,7 +2560,7 @@ func (r *Runtime) runWrapped(f func()) (err error) {
 	if ex != nil {
 		err = ex
 	}
-	if len(r.vm.callStack) == 0 {
+	if topLevel {
 		r.leave()
 	} else {
 		r.vm.clearStack()
