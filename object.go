@@ -151,6 +151,7 @@ type objectExportCacheItem map[reflect.Type]interface{}
 
 type objectExportCtx struct {
 	cache map[*Object]interface{}
+	diag  *exportDiag
 }
 
 type objectImpl interface {
@@ -1005,27 +1006,45 @@ func genericExportToMap(o *Object, dst reflect.Value, typ reflect.Type, ctx *obj
 	for item, next := iter.next(); next != nil; item, next = next() {
 		var kv reflect.Value
 		var err error
+		ctx.diagPush(ExportPathSegment{Name: item.name.String()})
 		if needConvertKeys {
 			kv = reflect.New(keyTyp).Elem()
 			err = r.toReflectValue(item.name, kv, ctx)
 			if err != nil {
+				if ctx.diag != nil {
+					return err
+				}
 				return fmt.Errorf("could not convert map key %s to %v: %w", item.name.String(), typ, err)
 			}
 		} else {
 			kv = reflect.ValueOf(item.name.String())
 		}
 
-		ival := o.self.getStr(item.name.string(), nil)
+		var ival Value
+		if ctx.diag != nil {
+			ex := r.vm.try(func() {
+				ival = o.self.getStr(item.name.string(), nil)
+			})
+			if ex != nil {
+				return ctx.diagError(ExportErrorGetterException, elemTyp, ex)
+			}
+		} else {
+			ival = o.self.getStr(item.name.string(), nil)
+		}
 		if ival != nil {
 			vv := reflect.New(elemTyp).Elem()
 			err = r.toReflectValue(ival, vv, ctx)
 			if err != nil {
+				if ctx.diag != nil {
+					return err
+				}
 				return fmt.Errorf("could not convert map value %v to %v at key %s: %w", ival, typ, item.name.String(), err)
 			}
 			dst.SetMapIndex(kv, vv)
 		} else {
 			dst.SetMapIndex(kv, reflect.Zero(elemTyp))
 		}
+		ctx.diagPop()
 	}
 
 	return nil
@@ -1058,10 +1077,12 @@ func genericExportToArrayOrSlice(o *Object, dst reflect.Value, typ reflect.Type,
 		}
 		ctx.putTyped(o, typ, dst.Interface())
 		for i, val := range values {
+			ctx.diagPush(ExportPathSegment{Index: i, IsIndex: true})
 			err = r.toReflectValue(val, dst.Index(i), ctx)
 			if err != nil {
 				return
 			}
+			ctx.diagPop()
 		}
 	} else {
 		// array-like
@@ -1082,11 +1103,23 @@ func genericExportToArrayOrSlice(o *Object, dst reflect.Value, typ reflect.Type,
 		}
 		ctx.putTyped(o, typ, dst.Interface())
 		for i := 0; i < l; i++ {
-			val := nilSafe(o.self.getIdx(valueInt(i), nil))
+			ctx.diagPush(ExportPathSegment{Index: i, IsIndex: true})
+			var val Value
+			if ctx.diag != nil {
+				ex := r.vm.try(func() {
+					val = nilSafe(o.self.getIdx(valueInt(i), nil))
+				})
+				if ex != nil {
+					return ctx.diagError(ExportErrorGetterException, typ.Elem(), ex)
+				}
+			} else {
+				val = nilSafe(o.self.getIdx(valueInt(i), nil))
+			}
 			err = r.toReflectValue(val, dst.Index(i), ctx)
 			if err != nil {
 				return
 			}
+			ctx.diagPop()
 		}
 	}
 

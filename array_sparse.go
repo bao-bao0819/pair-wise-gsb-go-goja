@@ -482,17 +482,31 @@ func (a *sparseArrayObject) exportToArrayOrSlice(dst reflect.Value, typ reflect.
 		ctx.putTyped(a.val, typ, dst.Interface())
 		for _, item := range a.items {
 			val := item.value
-			if p, ok := val.(*valueProperty); ok {
-				val = p.get(a.val)
-			}
 			idx := toIntStrict(int64(item.idx))
 			if idx >= l {
 				break
 			}
+			ctx.diagPush(ExportPathSegment{Index: idx, IsIndex: true})
+			if p, ok := val.(*valueProperty); ok {
+				if ctx.diag != nil {
+					ex := r.vm.try(func() {
+						val = p.get(a.val)
+					})
+					if ex != nil {
+						return ctx.diagError(ExportErrorGetterException, typ.Elem(), ex)
+					}
+				} else {
+					val = p.get(a.val)
+				}
+			}
 			err := r.toReflectValue(val, dst.Index(idx), ctx)
 			if err != nil {
+				if ctx.diag != nil {
+					return err
+				}
 				return fmt.Errorf("could not convert array element %v to %v at %d: %w", item.value, typ, idx, err)
 			}
+			ctx.diagPop()
 		}
 		return nil
 	}

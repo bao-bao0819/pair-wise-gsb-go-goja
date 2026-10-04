@@ -535,14 +535,28 @@ func (a *arrayObject) exportToArrayOrSlice(dst reflect.Value, typ reflect.Type, 
 			if i >= len(a.values) {
 				break
 			}
+			ctx.diagPush(ExportPathSegment{Index: i, IsIndex: true})
 			val := a.values[i]
 			if p, ok := val.(*valueProperty); ok {
-				val = p.get(a.val)
+				if ctx.diag != nil {
+					ex := r.vm.try(func() {
+						val = p.get(a.val)
+					})
+					if ex != nil {
+						return ctx.diagError(ExportErrorGetterException, typ.Elem(), ex)
+					}
+				} else {
+					val = p.get(a.val)
+				}
 			}
 			err := r.toReflectValue(val, dst.Index(i), ctx)
 			if err != nil {
+				if ctx.diag != nil {
+					return err
+				}
 				return fmt.Errorf("could not convert array element %v to %v at %d: %w", val, typ, i, err)
 			}
+			ctx.diagPop()
 		}
 		return nil
 	}

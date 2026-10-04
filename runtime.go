@@ -2151,10 +2151,16 @@ func (r *Runtime) toReflectValue(v Value, dst reflect.Value, ctx *objectExportCt
 		if et.Kind() == reflect.String {
 			tme, ok := dateParse(v.String())
 			if !ok {
-				return fmt.Errorf("could not convert string %v to %v", v, typ)
+				return ctx.diagError(ExportErrorTypeMismatch, typ, fmt.Errorf("could not convert string %v to %v", v, typ))
 			}
 			dst.Set(reflect.ValueOf(tme))
 			return nil
+		}
+	}
+
+	if ctx.diag != nil {
+		if handled, err := r.exportCheckedNumber(v, dst, typ, kind, ctx); handled {
+			return err
 		}
 	}
 
@@ -2207,7 +2213,12 @@ func (r *Runtime) toReflectValue(v Value, dst reflect.Value, ctx *objectExportCt
 				dst.Set(reflect.ValueOf(v))
 				return nil
 			}
-			return o.self.exportToArrayOrSlice(dst, typ, ctx)
+			if err := ctx.diagEnter(o, typ); err != nil {
+				return err
+			}
+			err := o.self.exportToArrayOrSlice(dst, typ, ctx)
+			ctx.diagLeave(o, typ)
+			return ctx.diagError(ExportErrorTypeMismatch, typ, err)
 		}
 	case reflect.Map:
 		if o, ok := v.(*Object); ok {
@@ -2215,7 +2226,12 @@ func (r *Runtime) toReflectValue(v Value, dst reflect.Value, ctx *objectExportCt
 				dst.Set(reflect.ValueOf(v))
 				return nil
 			}
-			return o.self.exportToMap(dst, typ, ctx)
+			if err := ctx.diagEnter(o, typ); err != nil {
+				return err
+			}
+			err := o.self.exportToMap(dst, typ, ctx)
+			ctx.diagLeave(o, typ)
+			return ctx.diagError(ExportErrorTypeMismatch, typ, err)
 		}
 	case reflect.Struct:
 		if o, ok := v.(*Object); ok {
@@ -2223,6 +2239,9 @@ func (r *Runtime) toReflectValue(v Value, dst reflect.Value, ctx *objectExportCt
 			if v, exists := ctx.getTyped(o, t); exists {
 				dst.Set(reflect.ValueOf(v).Elem())
 				return nil
+			}
+			if err := ctx.diagEnter(o, typ); err != nil {
+				return err
 			}
 			s := dst
 			ctx.putTyped(o, t, s.Addr().Interface())
@@ -2236,6 +2255,14 @@ func (r *Runtime) toReflectValue(v Value, dst reflect.Value, ctx *objectExportCt
 					var v Value
 					if field.Anonymous {
 						v = o
+					} else if ctx.diag != nil {
+						ctx.diagPush(ExportPathSegment{Name: name})
+						ex := r.vm.try(func() {
+							v = o.self.getStr(unistring.NewFromString(name), nil)
+						})
+						if ex != nil {
+							return ctx.diagError(ExportErrorGetterException, field.Type, ex)
+						}
 					} else {
 						v = o.self.getStr(unistring.NewFromString(name), nil)
 					}
@@ -2243,11 +2270,18 @@ func (r *Runtime) toReflectValue(v Value, dst reflect.Value, ctx *objectExportCt
 					if v != nil {
 						err := r.toReflectValue(v, s.Field(i), ctx)
 						if err != nil {
+							if ctx.diag != nil {
+								return err
+							}
 							return fmt.Errorf("could not convert struct value %v to %v for field %s: %w", v, field.Type, field.Name, err)
 						}
 					}
+					if !field.Anonymous {
+						ctx.diagPop()
+					}
 				}
 			}
+			ctx.diagLeave(o, typ)
 			return nil
 		}
 	case reflect.Func:
@@ -2268,7 +2302,7 @@ func (r *Runtime) toReflectValue(v Value, dst reflect.Value, ctx *objectExportCt
 		return r.toReflectValue(v, dst.Elem(), ctx)
 	}
 
-	return fmt.Errorf("could not convert %v to %v", v, typ)
+	return ctx.diagError(ExportErrorTypeMismatch, typ, fmt.Errorf("could not convert %v to %v", v, typ))
 }
 
 func (r *Runtime) wrapJSFunc(fn Callable, typ reflect.Type) func(args []reflect.Value) (results []reflect.Value) {

@@ -80,10 +80,12 @@ func (so *setObject) exportToArrayOrSlice(dst reflect.Value, typ reflect.Type, c
 		if entry == nil {
 			break
 		}
+		ctx.diagPush(ExportPathSegment{Index: i, IsIndex: true})
 		err := r.toReflectValue(entry.key, dst.Index(i), ctx)
 		if err != nil {
 			return err
 		}
+		ctx.diagPop()
 	}
 	return nil
 }
@@ -99,12 +101,14 @@ func (so *setObject) exportToMap(dst reflect.Value, typ reflect.Type, ctx *objec
 		if entry == nil {
 			break
 		}
+		ctx.diagPush(ExportPathSegment{Name: entry.key.String()})
 		keyVal := reflect.New(keyTyp).Elem()
 		err := r.toReflectValue(entry.key, keyVal, ctx)
 		if err != nil {
 			return err
 		}
 		dst.SetMapIndex(keyVal, reflect.Zero(elemTyp))
+		ctx.diagPop()
 	}
 	return nil
 }

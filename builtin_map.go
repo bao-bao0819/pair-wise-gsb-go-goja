@@ -79,6 +79,7 @@ func (mo *mapObject) exportToMap(dst reflect.Value, typ reflect.Type, ctx *objec
 		if entry == nil {
 			break
 		}
+		ctx.diagPush(ExportPathSegment{Name: entry.key.String()})
 		keyVal := reflect.New(keyTyp).Elem()
 		err := r.toReflectValue(entry.key, keyVal, ctx)
 		if err != nil {
@@ -90,6 +91,7 @@ func (mo *mapObject) exportToMap(dst reflect.Value, typ reflect.Type, ctx *objec
 			return err
 		}
 		dst.SetMapIndex(keyVal, elemVal)
+		ctx.diagPop()
 	}
 	return nil
 }
