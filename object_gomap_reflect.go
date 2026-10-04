@@ -41,6 +41,9 @@ func (o *objectGoMapReflect) _getKey(key reflect.Value) Value {
 		return nil
 	}
 	if v := o.fieldsValue.MapIndex(key); v.IsValid() {
+		if o.isReadOnly() {
+			return o.val.runtime.roValue(v, o.ctx)
+		}
 		rv := v
 		if rv.Kind() == reflect.Interface {
 			rv = rv.Elem()
@@ -75,6 +78,9 @@ func (o *objectGoMapReflect) getIdx(idx valueInt, receiver Value) Value {
 
 func (o *objectGoMapReflect) getOwnPropStr(name unistring.String) Value {
 	if v := o._getStr(name.String()); v != nil {
+		if o.isReadOnly() {
+			return o.roValueProperty(v)
+		}
 		return &valueProperty{
 			value:      v,
 			writable:   true,
@@ -86,6 +92,9 @@ func (o *objectGoMapReflect) getOwnPropStr(name unistring.String) Value {
 
 func (o *objectGoMapReflect) getOwnPropIdx(idx valueInt) Value {
 	if v := o._get(idx); v != nil {
+		if o.isReadOnly() {
+			return o.roValueProperty(v)
+		}
 		return &valueProperty{
 			value:      v,
 			writable:   true,
@@ -124,6 +133,9 @@ func (o *objectGoMapReflect) _put(key reflect.Value, val Value, throw bool) bool
 }
 
 func (o *objectGoMapReflect) setOwnStr(name unistring.String, val Value, throw bool) bool {
+	if o.isReadOnly() {
+		return o.roReject(throw, "assign a property")
+	}
 	n := name.String()
 	key := o.strToKey(n, false)
 	if !key.IsValid() || !o.fieldsValue.MapIndex(key).IsValid() {
@@ -149,6 +161,9 @@ func (o *objectGoMapReflect) setOwnStr(name unistring.String, val Value, throw b
 }
 
 func (o *objectGoMapReflect) setOwnIdx(idx valueInt, val Value, throw bool) bool {
+	if o.isReadOnly() {
+		return o.roReject(throw, "assign an element")
+	}
 	key := o.toKey(idx, false)
 	if !key.IsValid() || !o.fieldsValue.MapIndex(key).IsValid() {
 		if proto := o.prototype; proto != nil {
@@ -173,14 +188,31 @@ func (o *objectGoMapReflect) setOwnIdx(idx valueInt, val Value, throw bool) bool
 }
 
 func (o *objectGoMapReflect) setForeignStr(name unistring.String, val, receiver Value, throw bool) (bool, bool) {
+	if o.isReadOnly() && o.hasOwnPropertyStr(name) {
+		o.roReject(throw, "assign a property")
+		return false, true
+	}
 	return o._setForeignStr(name, trueValIfPresent(o.hasOwnPropertyStr(name)), val, receiver, throw)
 }
 
 func (o *objectGoMapReflect) setForeignIdx(idx valueInt, val, receiver Value, throw bool) (bool, bool) {
+	if o.isReadOnly() && o.hasOwnPropertyIdx(idx) {
+		o.roReject(throw, "assign an element")
+		return false, true
+	}
 	return o._setForeignIdx(idx, trueValIfPresent(o.hasOwnPropertyIdx(idx)), val, receiver, throw)
 }
 
 func (o *objectGoMapReflect) defineOwnPropertyStr(name unistring.String, descr PropertyDescriptor, throw bool) bool {
+	if o.isReadOnly() {
+		if cur := o._getStr(name.String()); cur != nil {
+			if o.roSameDataDescriptor(descr, cur) {
+				return true
+			}
+			return o.roReject(throw, "redefine a property")
+		}
+		return o.roReject(throw, "define a property")
+	}
 	if !o.val.runtime.checkHostObjectPropertyDescr(name, descr, throw) {
 		return false
 	}
@@ -189,6 +221,15 @@ func (o *objectGoMapReflect) defineOwnPropertyStr(name unistring.String, descr P
 }
 
 func (o *objectGoMapReflect) defineOwnPropertyIdx(idx valueInt, descr PropertyDescriptor, throw bool) bool {
+	if o.isReadOnly() {
+		if cur := o._get(idx); cur != nil {
+			if o.roSameDataDescriptor(descr, cur) {
+				return true
+			}
+			return o.roReject(throw, "redefine an element")
+		}
+		return o.roReject(throw, "define an element")
+	}
 	if !o.val.runtime.checkHostObjectPropertyDescr(idx.string(), descr, throw) {
 		return false
 	}
@@ -213,6 +254,12 @@ func (o *objectGoMapReflect) hasOwnPropertyIdx(idx valueInt) bool {
 }
 
 func (o *objectGoMapReflect) deleteStr(name unistring.String, throw bool) bool {
+	if o.isReadOnly() {
+		if o.hasOwnPropertyStr(name) {
+			return o.roReject(throw, "delete a property")
+		}
+		return true
+	}
 	key := o.strToKey(name.String(), throw)
 	if !key.IsValid() {
 		return false
@@ -222,6 +269,12 @@ func (o *objectGoMapReflect) deleteStr(name unistring.String, throw bool) bool {
 }
 
 func (o *objectGoMapReflect) deleteIdx(idx valueInt, throw bool) bool {
+	if o.isReadOnly() {
+		if o.hasOwnPropertyIdx(idx) {
+			return o.roReject(throw, "delete an element")
+		}
+		return true
+	}
 	key := o.toKey(idx, throw)
 	if !key.IsValid() {
 		return false

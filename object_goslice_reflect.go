@@ -76,6 +76,9 @@ func (o *objectGoSliceReflect) putLength(v uint32, throw bool) bool {
 
 func (o *objectGoSliceReflect) setOwnStr(name unistring.String, val Value, throw bool) bool {
 	if name == "length" {
+		if o.isReadOnly() {
+			return o.roReject(throw, "set the length")
+		}
 		return o.putLength(o.val.runtime.toLengthUint32(val), throw)
 	}
 	return o.objectGoArrayReflect.setOwnStr(name, val, throw)
@@ -83,6 +86,13 @@ func (o *objectGoSliceReflect) setOwnStr(name unistring.String, val Value, throw
 
 func (o *objectGoSliceReflect) defineOwnPropertyStr(name unistring.String, descr PropertyDescriptor, throw bool) bool {
 	if name == "length" {
+		if o.isReadOnly() {
+			current := intToValue(int64(o.fieldsValue.Len()))
+			if o.roSameDataDescriptor(descr, current) {
+				return true
+			}
+			return o.roReject(throw, "redefine the length")
+		}
 		return o.val.runtime.defineArrayLength(&o.lengthProp, descr, o.putLength, throw)
 	}
 	return o.objectGoArrayReflect.defineOwnPropertyStr(name, descr, throw)

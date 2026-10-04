@@ -115,6 +115,12 @@ type objectGoReflect struct {
 	toString, valueOf func() Value
 
 	toJson func() interface{}
+
+	readOnlyView
+}
+
+func (o *objectGoReflect) isReadOnly() bool {
+	return o.ctx != nil
 }
 
 func (o *objectGoReflect) init() {
@@ -220,6 +226,9 @@ func (o *objectGoReflect) _getMethod(jsName string) reflect.Value {
 }
 
 func (o *objectGoReflect) elemToValue(ev reflect.Value) (Value, reflectValueWrapper) {
+	if o.isReadOnly() {
+		return o.val.runtime.roValue(ev, o.ctx), nil
+	}
 	if isContainer(ev.Kind()) {
 		if ev.CanAddr() {
 			ev = ev.Addr()
@@ -268,6 +277,13 @@ func (o *objectGoReflect) _get(name string) Value {
 		}
 	}
 
+	if o.isReadOnly() {
+		if v := o.roGetMethod(name); v.IsValid() {
+			return o.val.runtime.toValue(v.Interface(), v)
+		}
+		return nil
+	}
+
 	if v := o._getMethod(name); v.IsValid() {
 		return o.val.runtime.toValue(v.Interface(), v)
 	}
@@ -279,6 +295,9 @@ func (o *objectGoReflect) getOwnPropStr(name unistring.String) Value {
 	n := name.String()
 	if o.fieldsValue.Kind() == reflect.Struct {
 		if v := o._getFieldValue(n); v != nil {
+			if o.isReadOnly() {
+				return o.roValueProperty(v)
+			}
 			return &valueProperty{
 				value:      v,
 				writable:   true,
@@ -287,9 +306,15 @@ func (o *objectGoReflect) getOwnPropStr(name unistring.String) Value {
 		}
 	}
 
-	if v := o._getMethod(n); v.IsValid() {
+	var method reflect.Value
+	if o.isReadOnly() {
+		method = o.roGetMethod(n)
+	} else {
+		method = o._getMethod(n)
+	}
+	if method.IsValid() {
 		return &valueProperty{
-			value:      o.val.runtime.toValue(v.Interface(), v),
+			value:      o.val.runtime.toValue(method.Interface(), method),
 			enumerable: true,
 		}
 	}
@@ -298,6 +323,9 @@ func (o *objectGoReflect) getOwnPropStr(name unistring.String) Value {
 }
 
 func (o *objectGoReflect) setOwnStr(name unistring.String, val Value, throw bool) bool {
+	if o.isReadOnly() {
+		return o.roReject(throw, "assign a property")
+	}
 	has, ok := o._put(name.String(), val, throw)
 	if !has {
 		if res, ok := o._setForeignStr(name, nil, val, o.val, throw); !ok {
@@ -311,10 +339,18 @@ func (o *objectGoReflect) setOwnStr(name unistring.String, val Value, throw bool
 }
 
 func (o *objectGoReflect) setForeignStr(name unistring.String, val, receiver Value, throw bool) (bool, bool) {
+	if o.isReadOnly() && o._has(name.String()) {
+		o.roReject(throw, "assign a property")
+		return false, true
+	}
 	return o._setForeignStr(name, trueValIfPresent(o._has(name.String())), val, receiver, throw)
 }
 
 func (o *objectGoReflect) setForeignIdx(idx valueInt, val, receiver Value, throw bool) (bool, bool) {
+	if o.isReadOnly() && o._has(idx.string().String()) {
+		o.roReject(throw, "assign a property")
+		return false, true
+	}
 	return o._setForeignIdx(idx, nil, val, receiver, throw)
 }
 
@@ -367,6 +403,16 @@ func (r *Runtime) checkHostObjectPropertyDescr(name unistring.String, descr Prop
 }
 
 func (o *objectGoReflect) defineOwnPropertyStr(name unistring.String, descr PropertyDescriptor, throw bool) bool {
+	if o.isReadOnly() {
+		n := name.String()
+		if o._has(n) {
+			if o.roSameDataDescriptor(descr, o._get(n)) {
+				return true
+			}
+			return o.roReject(throw, "redefine a property")
+		}
+		return o.roReject(throw, "define a property")
+	}
 	if o.val.runtime.checkHostObjectPropertyDescr(name, descr, throw) {
 		n := name.String()
 		if has, ok := o._put(n, descr.Value, throw); !has {
@@ -385,10 +431,17 @@ func (o *objectGoReflect) _has(name string) bool {
 			return true
 		}
 	}
-	if v := o._getMethod(name); v.IsValid() {
+	if v := o.methodByName(name); v.IsValid() {
 		return true
 	}
 	return false
+}
+
+func (o *objectGoReflect) methodByName(name string) reflect.Value {
+	if o.isReadOnly() {
+		return o.roGetMethod(name)
+	}
+	return o._getMethod(name)
 }
 
 func (o *objectGoReflect) hasOwnPropertyStr(name unistring.String) bool {
@@ -438,10 +491,41 @@ func (o *objectGoReflect) _toStringError() Value {
 func (o *objectGoReflect) deleteStr(name unistring.String, throw bool) bool {
 	n := name.String()
 	if o._has(n) {
+		if o.isReadOnly() {
+			return o.roReject(throw, "delete a property")
+		}
 		o.val.runtime.typeErrorResult(throw, "Cannot delete property %s from a Go type", n)
 		return false
 	}
 	return o.baseObject.deleteStr(name, throw)
+}
+
+func (o *objectGoReflect) setOwnSym(s *Symbol, v Value, throw bool) bool {
+	if o.isReadOnly() {
+		return o.roReject(throw, "add a symbol property")
+	}
+	return o.baseObject.setOwnSym(s, v, throw)
+}
+
+func (o *objectGoReflect) isExtensible() bool {
+	if o.isReadOnly() {
+		return false
+	}
+	return o.baseObject.isExtensible()
+}
+
+func (o *objectGoReflect) preventExtensions(throw bool) bool {
+	if o.isReadOnly() {
+		return true
+	}
+	return o.baseObject.preventExtensions(throw)
+}
+
+func (o *objectGoReflect) setProto(proto *Object, throw bool) bool {
+	if o.isReadOnly() {
+		return o.roReject(throw, "set the prototype")
+	}
+	return o.baseObject.setProto(proto, throw)
 }
 
 type goreflectPropIter struct {
@@ -463,9 +547,12 @@ func (i *goreflectPropIter) nextField() (propIterItem, iterNextFunc) {
 
 func (i *goreflectPropIter) nextMethod() (propIterItem, iterNextFunc) {
 	names := i.o.methodsInfo.Names
-	if i.idx < len(names) {
+	for i.idx < len(names) {
 		name := names[i.idx]
 		i.idx++
+		if i.o.isReadOnly() && !i.o.ctx.methodAllowed(name) {
+			continue
+		}
 		return propIterItem{name: newStringValue(name), enumerable: _ENUM_TRUE}, i.nextMethod
 	}
 
@@ -492,6 +579,9 @@ func (o *objectGoReflect) stringKeys(_ bool, accum []Value) []Value {
 	}
 
 	for _, name := range o.methodsInfo.Names {
+		if o.isReadOnly() && !o.ctx.methodAllowed(name) {
+			continue
+		}
 		accum = append(accum, newStringValue(name))
 	}
 

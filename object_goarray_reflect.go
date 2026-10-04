@@ -67,6 +67,10 @@ func (o *objectGoArrayReflect) init() {
 	o._init()
 	o.updateLen()
 	o.putIdx = o._putIdx
+	if o.isReadOnly() {
+		o.lengthProp.writable = false
+		o.lengthProp.configurable = false
+	}
 }
 
 func (o *objectGoArrayReflect) updateLen() {
@@ -127,6 +131,9 @@ func (o *objectGoArrayReflect) getStr(name unistring.String, receiver Value) Val
 func (o *objectGoArrayReflect) getOwnPropStr(name unistring.String) Value {
 	if idx := strToGoIdx(name); idx >= 0 {
 		if idx < o.fieldsValue.Len() {
+			if o.isReadOnly() {
+				return o.roValueProperty(o._getIdx(idx))
+			}
 			return &valueProperty{
 				value:      o._getIdx(idx),
 				writable:   true,
@@ -139,6 +146,12 @@ func (o *objectGoArrayReflect) getOwnPropStr(name unistring.String) Value {
 		if o.fieldsValue.Kind() == reflect.Slice {
 			o.updateLen()
 		}
+		if o.isReadOnly() {
+			lengthProp := o.lengthProp
+			lengthProp.writable = false
+			lengthProp.configurable = false
+			return &lengthProp
+		}
 		return &o.lengthProp
 	}
 	return o.objectGoReflect.getOwnPropStr(name)
@@ -146,6 +159,9 @@ func (o *objectGoArrayReflect) getOwnPropStr(name unistring.String) Value {
 
 func (o *objectGoArrayReflect) getOwnPropIdx(idx valueInt) Value {
 	if idx := toIntStrict(int64(idx)); idx >= 0 && idx < o.fieldsValue.Len() {
+		if o.isReadOnly() {
+			return o.roValueProperty(o._getIdx(idx))
+		}
 		return &valueProperty{
 			value:      o._getIdx(idx),
 			writable:   true,
@@ -177,6 +193,9 @@ func (o *objectGoArrayReflect) _putIdx(idx int, v Value, throw bool) bool {
 }
 
 func (o *objectGoArrayReflect) setOwnIdx(idx valueInt, val Value, throw bool) bool {
+	if o.isReadOnly() {
+		return o.roReject(throw, "assign an element")
+	}
 	if i := toIntStrict(int64(idx)); i >= 0 {
 		if i >= o.fieldsValue.Len() {
 			if res, ok := o._setForeignIdx(idx, nil, val, o.val, throw); ok {
@@ -196,6 +215,15 @@ func (o *objectGoArrayReflect) setOwnIdx(idx valueInt, val Value, throw bool) bo
 }
 
 func (o *objectGoArrayReflect) setOwnStr(name unistring.String, val Value, throw bool) bool {
+	if o.isReadOnly() {
+		if name == "length" {
+			return o.roReject(throw, "set the length")
+		}
+		if idx := strToGoIdx(name); idx >= 0 && idx < o.fieldsValue.Len() {
+			return o.roReject(throw, "assign an element")
+		}
+		return o.roReject(throw, "assign a property")
+	}
 	if idx := strToGoIdx(name); idx >= 0 {
 		if idx >= o.fieldsValue.Len() {
 			if res, ok := o._setForeignStr(name, nil, val, o.val, throw); ok {
@@ -214,10 +242,18 @@ func (o *objectGoArrayReflect) setOwnStr(name unistring.String, val Value, throw
 }
 
 func (o *objectGoArrayReflect) setForeignIdx(idx valueInt, val, receiver Value, throw bool) (bool, bool) {
+	if o.isReadOnly() && o._hasIdx(idx) {
+		o.roReject(throw, "assign an element")
+		return false, true
+	}
 	return o._setForeignIdx(idx, trueValIfPresent(o._hasIdx(idx)), val, receiver, throw)
 }
 
 func (o *objectGoArrayReflect) setForeignStr(name unistring.String, val, receiver Value, throw bool) (bool, bool) {
+	if o.isReadOnly() && o.hasOwnPropertyStr(name) {
+		o.roReject(throw, "assign a property")
+		return false, true
+	}
 	return o._setForeignStr(name, trueValIfPresent(o.hasOwnPropertyStr(name)), val, receiver, throw)
 }
 
@@ -234,6 +270,15 @@ func (o *objectGoArrayReflect) hasOwnPropertyStr(name unistring.String) bool {
 
 func (o *objectGoArrayReflect) defineOwnPropertyIdx(idx valueInt, descr PropertyDescriptor, throw bool) bool {
 	if i := toIntStrict(int64(idx)); i >= 0 {
+		if o.isReadOnly() {
+			if i < o.fieldsValue.Len() {
+				if o.roSameDataDescriptor(descr, o._getIdx(i)) {
+					return true
+				}
+				return o.roReject(throw, "redefine an element")
+			}
+			return o.roReject(throw, "define an element")
+		}
 		if !o.val.runtime.checkHostObjectPropertyDescr(idx.string(), descr, throw) {
 			return false
 		}
@@ -249,6 +294,15 @@ func (o *objectGoArrayReflect) defineOwnPropertyIdx(idx valueInt, descr Property
 
 func (o *objectGoArrayReflect) defineOwnPropertyStr(name unistring.String, descr PropertyDescriptor, throw bool) bool {
 	if idx := strToGoIdx(name); idx >= 0 {
+		if o.isReadOnly() {
+			if idx < o.fieldsValue.Len() {
+				if o.roSameDataDescriptor(descr, o._getIdx(idx)) {
+					return true
+				}
+				return o.roReject(throw, "redefine an element")
+			}
+			return o.roReject(throw, "define an element")
+		}
 		if !o.val.runtime.checkHostObjectPropertyDescr(name, descr, throw) {
 			return false
 		}
@@ -275,8 +329,14 @@ func (o *objectGoArrayReflect) _deleteIdx(idx int) {
 
 func (o *objectGoArrayReflect) deleteStr(name unistring.String, throw bool) bool {
 	if idx := strToGoIdx(name); idx >= 0 {
+		if o.isReadOnly() && idx < o.fieldsValue.Len() {
+			return o.roReject(throw, "delete an element")
+		}
 		o._deleteIdx(idx)
 		return true
+	}
+	if o.isReadOnly() && name == "length" {
+		return o.roReject(throw, "delete the length")
 	}
 
 	return o.objectGoReflect.deleteStr(name, throw)
@@ -284,6 +344,9 @@ func (o *objectGoArrayReflect) deleteStr(name unistring.String, throw bool) bool
 
 func (o *objectGoArrayReflect) deleteIdx(i valueInt, throw bool) bool {
 	idx := toIntStrict(int64(i))
+	if o.isReadOnly() && idx >= 0 && idx < o.fieldsValue.Len() {
+		return o.roReject(throw, "delete an element")
+	}
 	if idx >= 0 {
 		o._deleteIdx(idx)
 	}
@@ -329,6 +392,9 @@ func (o *objectGoArrayReflect) sortGet(i int) Value {
 }
 
 func (o *objectGoArrayReflect) swap(i int, j int) {
+	if o.isReadOnly() {
+		panic(o.val.runtime.NewTypeError("Cannot sort a read-only host array"))
+	}
 	vi := o.fieldsValue.Index(i)
 	vj := o.fieldsValue.Index(j)
 	tmp := reflect.New(o.fieldsValue.Type().Elem()).Elem()
